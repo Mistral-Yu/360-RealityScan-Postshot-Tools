@@ -4,21 +4,22 @@
 """
 ply_xyz_rgb_tool.py
 
-- .ply から (x,y,z) と (R,G,B) のみをロード
-- グリッド(ボクセル)でダウンサンプル
-  - --target で目標点数に近づくようボクセルサイズを自動調整（詳細ログを標準出力へ）
-  - --voxel-size で固定サイズ
-- ダウンサンプル後に --add で別点群を連結（addPoints）
-- 出力は binary little-endian PLY（vertex: x,y,z,red,green,blue）
+- Load only (x, y, z) and (R, G, B) from PLY files.
+- Optionally downsample on a voxel grid.
+  - --target-points automatically adjusts the voxel size to approach the target count (prints detailed logs).
+  - --voxel-size uses a fixed voxel size.
+- After downsampling, --append-ply concatenates additional point clouds.
+- Output is a binary little-endian PLY (vertex: x, y, z, red, green, blue).
 
-※ 固定ボクセル時の代表点は「各ボクセル中心に最も近い**元の点**」を選びます（重心座標ではなく）
+Note: With a fixed voxel size the representative point is the original point closest to the voxel center (not the centroid).
 
-依存: numpy, plyfile
+Dependencies: numpy, plyfile
     pip install numpy plyfile
 """
 
 from __future__ import annotations
 import argparse
+import os
 from typing import List, Optional, Tuple
 import numpy as np
 from plyfile import PlyData, PlyElement
@@ -33,7 +34,7 @@ def _fmt3(a) -> str:
 # ------------------------------ Load / Save ------------------------------
 
 def _find_vertex_data(ply: PlyData):
-    """vertex相当（x,y,z を持つ要素）を返す。"""
+    """Return the vertex element (an element that exposes x, y, z)."""
     try:
         return ply['vertex'].data
     except Exception:
@@ -49,13 +50,13 @@ def _find_vertex_data(ply: PlyData):
 def _extract_xyz_rgb_from_structured(v) -> Tuple[np.ndarray, np.ndarray]:
     names = v.dtype.names
     if not all(k in names for k in ('x', 'y', 'z')):
-        raise ValueError("x,y,z が見つかりません")
+        raise ValueError("Could not find x, y, z fields")
 
     xyz = np.stack([v['x'].astype(np.float32),
                     v['y'].astype(np.float32),
                     v['z'].astype(np.float32)], axis=1)
 
-    # 色フィールドの候補
+    # Candidate color field triplets
     cand = [
         ('red', 'green', 'blue'),
         ('r', 'g', 'b'),
@@ -83,14 +84,14 @@ def load_ply_xyz_rgb(path: str) -> Tuple[np.ndarray, np.ndarray]:
     ply = PlyData.read(path)
     vdata = _find_vertex_data(ply)
     if vdata is None:
-        raise ValueError(f"x,y,z を持つ頂点要素が見つかりません: {path}")
+        raise ValueError(f"Could not find a vertex element with x, y, z: {path}")
     xyz, rgb = _extract_xyz_rgb_from_structured(vdata)
     return xyz, rgb
 
 
 def save_ply_binary_little(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
     if xyz.shape[0] != rgb.shape[0]:
-        raise ValueError("xyz と rgb の行数が一致しません")
+        raise ValueError("xyz and rgb must have the same number of rows")
     n = xyz.shape[0]
     arr = np.empty(n, dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
                              ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')])
@@ -109,7 +110,7 @@ def save_ply_binary_little(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
 
 def _grid_keys(xyz: np.ndarray, voxel: float, xyz_min: Optional[np.ndarray] = None) -> np.ndarray:
     if voxel <= 0:
-        raise ValueError("voxel > 0 が必要です")
+        raise ValueError("voxel must be > 0")
     if xyz_min is None:
         xyz_min = xyz.min(axis=0, keepdims=True)
     keys = np.floor((xyz - xyz_min) / voxel).astype(np.int64, copy=False)
@@ -121,36 +122,37 @@ def voxel_downsample_by_size(
     rgb: np.ndarray,
     voxel: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    ボクセルサイズ固定のダウンサンプリング。
-    代表点は「各ボクセル中心に最も近い元の1点」を選択（xyz/rgbともにその点の値）。
+    """Downsample with a fixed voxel size.
+
+    The representative point for each voxel is the original point closest to the
+    voxel center (for both xyz and rgb).
     """
     xyz_min = xyz.min(axis=0, keepdims=True)
     keys = _grid_keys(xyz, voxel, xyz_min)                                # (N,3) int64
     uniq, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
     k = uniq.shape[0]
 
-    # 各ボクセルの中心座標 (K,3)
+    # Center coordinate of each voxel (K,3)
     centers = (xyz_min + (uniq.astype(np.float32) + 0.5) * voxel).astype(np.float32)
 
-    # 各点ごとに対応ボクセル中心との差を取り、距離二乗を算出
+    # Compute the squared distance to the voxel center for each point
     center_per_point = centers[inv]                                        # (N,3)
     diff = xyz.astype(np.float32, copy=False) - center_per_point
     dist2 = (diff * diff).sum(axis=1)                                      # (N,)
 
-    # inv でソートして各グループごとに最小の dist2 のインデックスを取る
-    order = np.argsort(inv, kind='mergesort')                              # 安全な安定ソート
+    # Sort by voxel id to pick the minimum dist2 per group
+    order = np.argsort(inv, kind='mergesort')                              # Stable sort
     inv_sorted = inv[order]
     dist2_sorted = dist2[order]
 
-    # グループの開始位置を検出
+    # Detect the start/end of each group
     starts = np.flatnonzero(np.r_[True, inv_sorted[1:] != inv_sorted[:-1]])
     ends = np.r_[starts[1:], inv_sorted.size]
 
     pick_idx = np.empty(k, dtype=np.int64)
     for a, b in zip(starts, ends):
         gid = int(inv_sorted[a])
-        # グループ内の相対 argmin を求め、元のインデックスに戻す
+        # Argmin within the group and map back to the original index
         rel = a + int(np.argmin(dist2_sorted[a:b]))
         orig = int(order[rel])
         pick_idx[gid] = orig
@@ -168,37 +170,46 @@ def _unique_voxel_count(xyz: np.ndarray, voxel: float, xyz_min: Optional[np.ndar
 def voxel_downsample_to_target(
     xyz: np.ndarray,
     rgb: np.ndarray,
-    target_n: int,
+    target_points: int,
     tol_ratio: float = 0.02,
     max_iter: int = 25,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """目標点数に近づくようにボクセルサイズを自動調整（詳細ログ出力）。"""
+    """Automatically adjust the voxel size to approach a target point count."""
+
     n = xyz.shape[0]
-    print(f"[target] n={n:,}  target={target_n:,}  tol=±{tol_ratio*100:.1f}%  max_iter={max_iter}")
-    if target_n <= 0 or target_n >= n:
-        print(f"[target] skip: target={target_n} は範囲外（出力=入力のまま）")
+    print(
+        f"[target] input_points={n:,}  target={target_points:,}  "
+        f"tol=±{tol_ratio * 100:.1f}%  max_iter={max_iter}"
+    )
+    if target_points <= 0 or target_points >= n:
+        print(
+            f"[target] skip: target={target_points} is out of range (output = input)"
+        )
         return xyz.astype(np.float32, copy=False), rgb.astype(np.uint8, copy=False)
 
     xyz_min = xyz.min(axis=0)
     xyz_max = xyz.max(axis=0)
     extent = np.maximum(xyz_max - xyz_min, 1e-9)
     vol = float(extent[0] * extent[1] * extent[2])
-    v0 = (vol / float(target_n)) ** (1.0 / 3.0) if vol > 0 else 1e-3
+    v0 = (vol / float(target_points)) ** (1.0 / 3.0) if vol > 0 else 1e-3
 
     lo = max(v0 / 64.0, 1e-9)
     hi = max(v0 * 64.0, lo * 2.0)
-    print(f"[aabb] min={_fmt3(xyz_min)}  max={_fmt3(xyz_max)}  extent={_fmt3(extent)}  vol≈{vol:.6g}")
+    print(
+        f"[aabb] min={_fmt3(xyz_min)}  max={_fmt3(xyz_max)}  "
+        f"extent={_fmt3(extent)}  volume≈{vol:.6g}"
+    )
     print(f"[init] v0≈{v0:.6g}  lo={lo:.6g}  hi={hi:.6g}")
 
-    # hi を拡張して "ユニークボクセル数 <= target" を満たす上限を確保
-    for k in range(10):
+    # Expand hi until the unique voxel count is at most the target.
+    for _ in range(10):
         cnt_hi = _unique_voxel_count(xyz, hi, xyz_min)
         print(f"[expand] try hi={hi:.6g} -> unique={cnt_hi:,}")
-        if cnt_hi <= target_n:
+        if cnt_hi <= target_points:
             break
         hi *= 2.0
     else:
-        print("[expand] warn: 十分な上限が見つからない可能性")
+        print("[expand] warning: could not find a sufficient upper bound")
 
     best_voxel = v0
     best_diff = 10**18
@@ -207,25 +218,34 @@ def voxel_downsample_to_target(
     for it in range(1, max_iter + 1):
         mid = 0.5 * (lo + hi)
         cnt = _unique_voxel_count(xyz, mid, xyz_min)
-        diff = abs(cnt - target_n)
-        ratio = diff / float(target_n)
+        diff = abs(cnt - target_points)
+        ratio = diff / float(target_points)
         if diff < best_diff:
             best_diff = diff
             best_voxel = mid
             best_cnt = cnt
-        decision = "lo=mid (cnt>target → voxel↑)" if cnt > target_n else "hi=mid (cnt<target → voxel↓)"
-        print(f"[iter {it:02d}] voxel={mid:.6g}  unique={cnt:,}  diff={diff:,} ({ratio:.2%})  -> {decision}")
+        decision = (
+            "lo = mid (cnt > target -> increase voxel size)"
+            if cnt > target_points
+            else "hi = mid (cnt < target -> decrease voxel size)"
+        )
+        print(
+            f"[iter {it:02d}] voxel={mid:.6g}  unique={cnt:,}  diff={diff:,} "
+            f"({ratio:.2%})  -> {decision}"
+        )
         if ratio <= tol_ratio:
-            print(f"[stop] 許容内に到達: voxel={mid:.6g}  unique={cnt:,}")
+            print(f"[stop] within tolerance: voxel={mid:.6g}  unique={cnt:,}")
             best_voxel = mid
             best_cnt = cnt
             break
-        if cnt > target_n:
+        if cnt > target_points:
             lo = mid
         else:
             hi = mid
 
-    print(f"[best] voxel≈{best_voxel:.6g}  unique≈{best_cnt:,}  (best_diff={best_diff:,})")
+    print(
+        f"[best] voxel≈{best_voxel:.6g}  unique≈{best_cnt:,}  (best_diff={best_diff:,})"
+    )
 
     out_xyz, out_rgb = voxel_downsample_by_size(xyz, rgb, best_voxel)
     print(f"[final] voxel={best_voxel:.6g}  out_points={out_xyz.shape[0]:,}")
@@ -235,47 +255,91 @@ def voxel_downsample_to_target(
 # ------------------------------ CLI ------------------------------
 
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="PLY(XYZ+RGB) ロード/保存 + グリッドダウンサンプル + addPoints 連結")
-    ap.add_argument("input", help="入力 PLY（ベース点群）")
-    ap.add_argument("-o", "--output", required=True, help="出力 PLY（binary little-endian）")
-    ap.add_argument("--target", type=int, default=None, help="目標点数（近似）。指定時は --voxel-size より優先")
-    ap.add_argument("--voxel-size", type=float, default=None, help="固定ボクセルサイズ（m）")
-    ap.add_argument("--add", action="append", default=[], help="ダウンサンプル後に追加する PLY（複数可）")
-    ap.add_argument("--no-downsample", action="store_true", help="ダウンサンプリングを行わない")
+    ap = argparse.ArgumentParser(
+        description="PLY (XYZ+RGB) load/save + voxel grid downsampling + optional append"
+    )
+    ap.add_argument(
+        "-i",
+        "--in",
+        dest="input",
+        required=True,
+        help="Input PLY file path",
+    )
+    ap.add_argument(
+        "-o",
+        "--out",
+        dest="output",
+        required=True,
+        help="Output PLY (binary little-endian)",
+    )
+    ap.add_argument(
+        "--target-points",
+        type=int,
+        default=None,
+        help=(
+            "Target number of points after downsampling (approximate). "
+            "Overrides --voxel-size when provided."
+        ),
+    )
+    ap.add_argument(
+        "--voxel-size",
+        type=float,
+        default=None,
+        help="Fixed voxel size in meters.",
+    )
+    ap.add_argument(
+        "--append-ply",
+        action="append",
+        default=[],
+        help=(
+            "Additional PLY files to append after downsampling."
+            " Paths are resolved relative to the input file when not absolute."
+            " May be specified multiple times."
+        ),
+    )
     args = ap.parse_args(argv)
 
-    # 1) 読み込み
-    xyz, rgb = load_ply_xyz_rgb(args.input)
-    print(f"[load] base: {args.input}  points={xyz.shape[0]:,}")
+    base_path = os.path.expanduser(args.input)
+    if not os.path.isabs(base_path):
+        base_path = os.path.abspath(base_path)
+    base_dir = os.path.dirname(base_path) or "."
 
-    # 2) ダウンサンプル
-    if not args.no_downsample:
-        if args.voxel_size is not None and args.voxel_size > 0:
-            print(f"[downsample] fixed voxel-size={args.voxel_size:.6g}")
-            xyz, rgb = voxel_downsample_by_size(xyz, rgb, args.voxel_size)
-            print(f"[downsample] -> {xyz.shape[0]:,} points")
-        elif args.target is not None and args.target > 0:
-            xyz, rgb = voxel_downsample_to_target(xyz, rgb, args.target)
-            print(f"[downsample] target={args.target:,} -> {xyz.shape[0]:,} points")
-        else:
-            print("[downsample] skip (no voxel-size/target)")
+    # 1) Load
+    xyz, rgb = load_ply_xyz_rgb(base_path)
+    print(f"[load] base: {base_path}  points={xyz.shape[0]:,}")
+
+    # 2) Downsample
+    if args.voxel_size is not None and args.voxel_size > 0:
+        print(f"[downsample] fixed voxel-size={args.voxel_size:.6g}")
+        xyz, rgb = voxel_downsample_by_size(xyz, rgb, args.voxel_size)
+        print(f"[downsample] -> {xyz.shape[0]:,} points")
+    elif args.target_points is not None and args.target_points > 0:
+        xyz, rgb = voxel_downsample_to_target(xyz, rgb, args.target_points)
+        print(f"[downsample] target_points={args.target_points:,} -> {xyz.shape[0]:,} points")
     else:
-        print("[downsample] skipped by --no-downsample")
+        print("[downsample] skip (no voxel-size/target-points)")
 
-    # 3) 追加連結（ダウンサンプルの後）
+    # 3) Append additional clouds (after downsampling)
     total_added = 0
-    for apath in args.add:
-        ax, ac = load_ply_xyz_rgb(apath)
+    for apath in args.append_ply:
+        full_path = os.path.expanduser(apath)
+        if not os.path.isabs(full_path):
+            full_path = os.path.join(base_dir, full_path)
+        full_path = os.path.abspath(full_path)
+        ax, ac = load_ply_xyz_rgb(full_path)
         xyz = np.concatenate([xyz, ax], axis=0)
         rgb = np.concatenate([rgb, ac], axis=0)
         total_added += ax.shape[0]
-        print(f"[addPoints] {apath} +{ax.shape[0]:,} -> total {xyz.shape[0]:,}")
+        print(f"[append] {full_path} +{ax.shape[0]:,} -> total {xyz.shape[0]:,}")
     if total_added > 0:
-        print(f"[addPoints] total added: {total_added:,}")
+        print(f"[append] total added: {total_added:,}")
 
-    # 4) 保存
-    save_ply_binary_little(args.output, xyz, rgb)
-    print(f"[save] {args.output}  points={xyz.shape[0]:,}  (binary little-endian)")
+    # 4) Save
+    out_path = os.path.expanduser(args.output)
+    if not os.path.isabs(out_path):
+        out_path = os.path.abspath(out_path)
+    save_ply_binary_little(out_path, xyz, rgb)
+    print(f"[save] {out_path}  points={xyz.shape[0]:,}  (binary little-endian)")
     return 0
 
 
