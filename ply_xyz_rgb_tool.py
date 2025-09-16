@@ -259,14 +259,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         description="PLY (XYZ+RGB) load/save + voxel grid downsampling + optional append"
     )
     ap.add_argument(
-        "--in_dir",
+        "-i",
+        "--in",
+        dest="input",
         required=True,
-        help="Directory that contains the input PLY files",
+        help="Input PLY file path",
     )
-    ap.add_argument("input", help="Input PLY file (relative to --in_dir)")
     ap.add_argument(
         "-o",
-        "--output",
+        "--out",
+        dest="output",
         required=True,
         help="Output PLY (binary little-endian)",
     )
@@ -290,16 +292,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="append",
         default=[],
         help=(
-            "Additional PLY files to append after downsampling (relative to --in_dir). "
-            "May be specified multiple times."
+            "Additional PLY files to append after downsampling."
+            " Paths are resolved relative to the input file when not absolute."
+            " May be specified multiple times."
         ),
     )
     args = ap.parse_args(argv)
 
-    in_dir = args.in_dir
-    base_path = args.input
+    base_path = os.path.expanduser(args.input)
     if not os.path.isabs(base_path):
-        base_path = os.path.join(in_dir, base_path)
+        base_path = os.path.abspath(base_path)
+    base_dir = os.path.dirname(base_path) or "."
 
     # 1) Load
     xyz, rgb = load_ply_xyz_rgb(base_path)
@@ -319,9 +322,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 3) Append additional clouds (after downsampling)
     total_added = 0
     for apath in args.append_ply:
-        full_path = apath
+        full_path = os.path.expanduser(apath)
         if not os.path.isabs(full_path):
-            full_path = os.path.join(in_dir, full_path)
+            full_path = os.path.join(base_dir, full_path)
+        full_path = os.path.abspath(full_path)
         ax, ac = load_ply_xyz_rgb(full_path)
         xyz = np.concatenate([xyz, ax], axis=0)
         rgb = np.concatenate([rgb, ac], axis=0)
@@ -331,8 +335,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[append] total added: {total_added:,}")
 
     # 4) Save
-    save_ply_binary_little(args.output, xyz, rgb)
-    print(f"[save] {args.output}  points={xyz.shape[0]:,}  (binary little-endian)")
+    out_path = os.path.expanduser(args.output)
+    if not os.path.isabs(out_path):
+        out_path = os.path.abspath(out_path)
+    save_ply_binary_little(out_path, xyz, rgb)
+    print(f"[save] {out_path}  points={xyz.shape[0]:,}  (binary little-endian)")
     return 0
 
 
