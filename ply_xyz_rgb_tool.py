@@ -163,9 +163,10 @@ def voxel_downsample_by_size(
     xyz: np.ndarray,
     rgb: np.ndarray,
     voxel: float,
+    *,
+    representative: str = "center",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Downsample with a fixed voxel size.
-
     The representative point for each voxel is the original point closest to the
     voxel center (for both xyz and rgb).
     """
@@ -294,7 +295,9 @@ def voxel_downsample_to_target(
         f"[best] voxel≈{best_voxel:.6g}  unique≈{best_cnt:,}  (best_diff={best_diff:,})"
     )
 
-    out_xyz, out_rgb = voxel_downsample_by_size(xyz, rgb, best_voxel)
+    out_xyz, out_rgb = voxel_downsample_by_size(
+        xyz, rgb, best_voxel, representative="centroid"
+    )
     print(f"[final] voxel={best_voxel:.6g}  out_points={out_xyz.shape[0]:,}")
     return out_xyz, out_rgb
 
