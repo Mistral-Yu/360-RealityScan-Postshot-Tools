@@ -405,8 +405,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             target_points = computed_target
 
     include_voxel_reference = not (target_points is not None and target_points > 0)
-    print_point_cloud_stats(stats, include_voxel_reference=include_voxel_reference)
-
+    print_point_cloud_stats(stats, include_voxel_reference=include_voxel_reference
     # 2) Downsample
     if args.voxel_size is not None and args.voxel_size > 0:
         print(f"[downsample] fixed voxel-size={args.voxel_size:.6g}")
