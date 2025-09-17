@@ -11,9 +11,7 @@ ply_xyz_rgb_tool.py
 - After downsampling, --append-ply concatenates additional point clouds.
 - Output is a binary little-endian PLY (vertex: x, y, z, red, green, blue).
 
-Note: With a fixed voxel size the representative point is the original point closest to the voxel center.
-      With target-based downsampling the representative is the point closest to the centroid of
-      the points within each voxel.
+Note: With a fixed voxel size the representative point is the original point closest to the voxel center (not the centroid).
 
 Dependencies: numpy, plyfile
     pip install numpy plyfile
@@ -169,30 +167,20 @@ def voxel_downsample_by_size(
     representative: str = "center",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Downsample with a fixed voxel size.
-
-    `representative` selects how to pick the kept point for each voxel:
-      - "center"   -> point closest to the voxel center.
-      - "centroid" -> point closest to the centroid of all points in the voxel.
+    The representative point for each voxel is the original point closest to the
+    voxel center (for both xyz and rgb).
     """
     xyz_min = xyz.min(axis=0, keepdims=True)
     keys = _grid_keys(xyz, voxel, xyz_min)                                # (N,3) int64
     uniq, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
     k = uniq.shape[0]
 
-    xyz32 = xyz.astype(np.float32, copy=False)
+    # Center coordinate of each voxel (K,3)
+    centers = (xyz_min + (uniq.astype(np.float32) + 0.5) * voxel).astype(np.float32)
 
-    if representative == "center":
-        targets = (xyz_min + (uniq.astype(np.float32) + 0.5) * voxel).astype(np.float32)
-    elif representative == "centroid":
-        sums = np.zeros((k, 3), dtype=np.float64)
-        np.add.at(sums, inv, xyz.astype(np.float64, copy=False))
-        centroids = sums / counts[:, None]
-        targets = centroids.astype(np.float32, copy=False)
-    else:
-        raise ValueError(f"Unknown representative strategy: {representative}")
-
-    target_per_point = targets[inv]                                        # (N,3)
-    diff = xyz32 - target_per_point
+    # Compute the squared distance to the voxel center for each point
+    center_per_point = centers[inv]                                        # (N,3)
+    diff = xyz.astype(np.float32, copy=False) - center_per_point
     dist2 = (diff * diff).sum(axis=1)                                      # (N,)
 
     # Sort by voxel id to pick the minimum dist2 per group
@@ -344,15 +332,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     ap.add_argument(
-        "--target-percent",
-        type=float,
-        default=None,
-        help=(
-            "Target percentage of the input point count. "
-            "The percentage is converted to --target-points after loading."
-        ),
-    )
-    ap.add_argument(
         "--voxel-size",
         type=float,
         default=None,
@@ -380,46 +359,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[load] base: {base_path}  points={xyz.shape[0]:,}")
 
     stats = compute_point_cloud_stats(xyz)
+    include_voxel_reference = not (
+        args.target_points is not None and args.target_points > 0
+    )
+    print_point_cloud_stats(stats, include_voxel_reference=include_voxel_reference)
 
-    target_points = args.target_points if args.target_points and args.target_points > 0 else None
-    if args.target_percent is not None:
-        pct = args.target_percent
-        if pct <= 0 or stats.count == 0:
-            computed_target = 0
-        else:
-            computed_target = int(round(stats.count * (pct / 100.0)))
-            computed_target = max(1, min(stats.count, computed_target))
-        print(
-            "[target-percent]",
-            f"{pct:.6g}% of {stats.count:,} -> target_points={computed_target:,}",
-        )
-        if computed_target > 0:
-            if (
-                target_points is not None
-                and target_points != computed_target
-            ):
-                print(
-                    "[target-percent] override",
-                    f"replacing explicit target_points={target_points:,}",
-                )
-            target_points = computed_target
-
-    include_voxel_reference = not (target_points is not None and target_points > 0)
-    print_point_cloud_stats(stats, include_voxel_reference=include_voxel_reference
     # 2) Downsample
     if args.voxel_size is not None and args.voxel_size > 0:
         print(f"[downsample] fixed voxel-size={args.voxel_size:.6g}")
         xyz, rgb = voxel_downsample_by_size(xyz, rgb, args.voxel_size)
         print(f"[downsample] -> {xyz.shape[0]:,} points")
-    elif target_points is not None and target_points > 0:
+    elif args.target_points is not None and args.target_points > 0:
         xyz, rgb = voxel_downsample_to_target(
             xyz,
             rgb,
-            target_points,
+            args.target_points,
             stats=stats,
             log_bounds=False,
         )
-        print(f"[downsample] target_points={target_points:,} -> {xyz.shape[0]:,} points")
+        print(f"[downsample] target_points={args.target_points:,} -> {xyz.shape[0]:,} points")
     else:
         print("[downsample] skip (no voxel-size/target-points)")
 
