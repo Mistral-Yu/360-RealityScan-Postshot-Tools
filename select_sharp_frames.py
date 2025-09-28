@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 select_sharp_frames.py (listdir-based sharp frame selector)
@@ -598,6 +598,65 @@ def _compute_pair_flow_magnitude(prev_path, curr_path, crop_ratio):
 
 
 
+
+
+def load_selection_from_csv(csv_path, files, scores, brightness_mean_arr, group_score_arr, flow_mag_arr):
+    """Load selection flags and metrics from an existing CSV."""
+    selection_flags = [0] * len(files)
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError("CSV file has no header")
+        fields_lower = {name.lower(): name for name in reader.fieldnames}
+        if "selected(1=keep)" in fields_lower:
+            selected_key = fields_lower["selected(1=keep)"]
+        elif "selected" in fields_lower:
+            selected_key = fields_lower["selected"]
+        else:
+            raise ValueError("CSV missing 'selected(1=keep)' column")
+        index_key = fields_lower.get("index")
+        score_key = fields_lower.get("score")
+        brightness_key = fields_lower.get("brightness_mean")
+        group_key = fields_lower.get("group_score")
+        flow_key = fields_lower.get("flow_motion")
+
+        for row in reader:
+            if index_key is None:
+                raise ValueError("CSV missing 'index' column")
+            try:
+                idx = int(row[index_key])
+            except (TypeError, ValueError):
+                continue
+            if idx < 0 or idx >= len(files):
+                continue
+            flag_raw = str(row.get(selected_key, "0")).strip()
+            keep_flag = 1 if flag_raw in {"1", "true", "True"} else 0
+            selection_flags[idx] = keep_flag
+
+            if score_key and row.get(score_key) not in (None, ""):
+                try:
+                    score_val = float(row[score_key])
+                except ValueError:
+                    scores[idx] = None
+                else:
+                    scores[idx] = None if score_val < 0.0 else score_val
+            if brightness_key and row.get(brightness_key) not in (None, ""):
+                try:
+                    brightness_mean_arr[idx] = float(row[brightness_key])
+                except ValueError:
+                    pass
+            if group_key and row.get(group_key) not in (None, ""):
+                try:
+                    group_score_arr[idx] = float(row[group_key])
+                except ValueError:
+                    pass
+            if flow_key and row.get(flow_key) not in (None, ""):
+                try:
+                    flow_mag_arr[idx] = float(row[flow_key])
+                except ValueError:
+                    pass
+    return selection_flags
+
 def augment_motion_segments(
     final_selected,
     group_infos,
@@ -748,8 +807,8 @@ def main():
         "-n",
         "--segment_size",
         type=positive_int,
-        required=True,
-        help="Number of consecutive frames considered per segment.",
+        default=None,
+        help="Number of consecutive frames considered per segment (required unless --apply_csv).",
     )
     ap.add_argument(
         "-e",
@@ -858,6 +917,11 @@ def main():
         help="Perform scoring and selection without moving files.",
     )
     ap.add_argument(
+        "-a",
+        "--apply_csv",
+        help="Apply selections from an existing CSV produced during a dry run.",
+    )
+    ap.add_argument(
         "--enhance_motion",
         action="store_true",
         help="Apply additional motion blur penalty during hybrid scoring.",
@@ -881,6 +945,11 @@ def main():
 
     args = ap.parse_args()
 
+    if not args.apply_csv and args.segment_size is None:
+        print("--segment_size is required unless --apply_csv is provided.")
+        sys.exit(1)
+
+
     flow_crop_ratio = args.flow_crop_ratio
     if not (0.0 < flow_crop_ratio <= 1.0):
         raise SystemExit("--flow_crop_ratio must be in (0, 1]")
@@ -898,14 +967,17 @@ def main():
         print(f"No input images found: {args.in_dir}")
         sys.exit(1)
 
-    if args.max_spacing <= 0:
-        args.max_spacing = round_half_up(args.segment_size * 0.8)
+    if not args.apply_csv:
+        if args.max_spacing <= 0:
+            args.max_spacing = round_half_up(args.segment_size * 0.8)
 
-    min_spacing_raw = round_half_up(args.segment_size * 0.2)
-    if min_spacing_raw <= 1:
-        min_diff = 2
+        min_spacing_raw = round_half_up(args.segment_size * 0.2)
+        if min_spacing_raw <= 1:
+            min_diff = 2
+        else:
+            min_diff = min_spacing_raw + 1
     else:
-        min_diff = min_spacing_raw + 1
+        min_diff = 1
 
     sorter = SORTERS[args.sort]
     files = sorted(files, key=sorter)
@@ -928,121 +1000,162 @@ def main():
     group_score_arr = [0.0] * n
     flow_mag_arr = [0.0] * n
 
+    total = n
+
+
+
+
+    selection_flags = [0] * n
+    gap_added_count = 0
+    motion_added_count = 0
+    final_selected = set()
+    initial_selected = set()
+    group_infos = []
+
     workers = (
         args.workers
         if (args.workers and args.workers > 0)
         else min(8, (os.cpu_count() or 4))
     )
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {
-            ex.submit(
-                score_one_file, files[i],
-                args.metric, args.crop_ratio,
-                args.use_exposure, args.clip_penalty, args.clip_thresh,
-                args.max_long, args.enhance_motion
-            ): i for i in range(n)
-        }
-        completed = 0
-        last_pct = -1
-        for fut in as_completed(futs):
-            i = futs[fut]
-            (
-                s,
-                p0,
-                p255,
-                brightness_mean,
-                brightness_weight,
-                lap_feature,
-                ten_feature,
-                fft_feature,
-                motion_factor,
-                exposure_factor,
-            ) = fut.result()
-            scores[i] = s
-            p0_arr[i] = p0
-            p255_arr[i] = p255
-            brightness_mean_arr[i] = brightness_mean
-            brightness_arr[i] = brightness_weight
-            lap_arr[i] = lap_feature
-            ten_arr[i] = ten_feature
-            fft_arr[i] = fft_feature
-            motion_arr[i] = motion_factor
-            exposure_arr[i] = exposure_factor
-            completed += 1
-            last_pct = update_progress("Scoring", completed, n, last_pct)
 
-
-
-    if args.enhance_motion and n > 1:
-        flow_pairs = []
-        prev_idx = None
-        for idx in range(n):
-            fp = files[idx]
-            if not os.path.isfile(fp):
-                prev_idx = None
-                continue
-            if prev_idx is not None:
-                flow_pairs.append((prev_idx, idx))
-            prev_idx = idx
-        if flow_pairs:
-            with ThreadPoolExecutor(max_workers=workers) as flow_executor:
-                flow_futs = {
-                    flow_executor.submit(
-                        _compute_pair_flow_magnitude,
-                        files[left_idx],
-                        files[right_idx],
-                        flow_crop_ratio,
-                    ): (left_idx, right_idx)
-                    for left_idx, right_idx in flow_pairs
-                }
-                for fut in as_completed(flow_futs):
-                    left_idx, right_idx = flow_futs[fut]
-                    try:
-                        mean_mag = fut.result()
-                    except Exception:
-                        mean_mag = FLOW_MISSING_HIGH_VALUE
-                    if mean_mag is None:
-                        mean_mag = FLOW_MISSING_HIGH_VALUE
-                    flow_mag_arr[right_idx] = max(flow_mag_arr[right_idx], mean_mag)
-                    flow_mag_arr[left_idx] = max(flow_mag_arr[left_idx], mean_mag)
-
-
-    if args.metric == "hybrid":
-        lap_values = np.array([v for v in lap_arr if v is not None], dtype=np.float64)
-        ten_values = np.array([v for v in ten_arr if v is not None], dtype=np.float64)
-        fft_values = np.array([v for v in fft_arr if v is not None], dtype=np.float64)
-
-        lap_values = [v for v in lap_arr if v is not None]
-        ten_values = [v for v in ten_arr if v is not None]
-        fft_values = [v for v in fft_arr if v is not None]
-
-        def _normalize_feature(values, value):
-            if not values or value is None:
-                return 0.0
-            vmin = min(values)
-            vmax = max(values)
-            if math.isclose(vmax, vmin):
-                return 0.0
-            return (value - vmin) / (vmax - vmin)
-
-        for idx in range(n):
-            if lap_arr[idx] is None:
-                continue
-            lap_norm = _normalize_feature(lap_values, lap_arr[idx])
-            ten_norm = _normalize_feature(ten_values, ten_arr[idx])
-            fft_norm = _normalize_feature(fft_values, fft_arr[idx])
-
-            combined = (
-                HYBRID_LAPVAR_WEIGHT * lap_norm
-                + HYBRID_TENENGRAD_WEIGHT * ten_norm
-                + HYBRID_FFT_WEIGHT * fft_norm
+    if args.apply_csv:
+        apply_csv_path = args.apply_csv
+        if not os.path.isabs(apply_csv_path):
+            apply_csv_path = os.path.join(args.in_dir, apply_csv_path)
+        if not os.path.isfile(apply_csv_path):
+            print(f"Selection CSV not found: {apply_csv_path}")
+            sys.exit(1)
+        try:
+            selection_flags = load_selection_from_csv(
+                apply_csv_path,
+                files,
+                scores,
+                brightness_mean_arr,
+                group_score_arr,
+                flow_mag_arr,
             )
+        except ValueError as exc:
+            print(f"Failed to load selection CSV: {exc}")
+            sys.exit(1)
+        final_selected = {
+            idx for idx, flag in enumerate(selection_flags)
+            if flag == 1 and os.path.isfile(files[idx])
+        }
+        initial_selected = set(final_selected)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {
+                ex.submit(
+                    score_one_file, files[i],
+                    args.metric, args.crop_ratio,
+                    args.use_exposure, args.clip_penalty, args.clip_thresh,
+                    args.max_long, args.enhance_motion
+                ): i for i in range(n)
+            }
+            completed = 0
+            last_pct = -1
+            for fut in as_completed(futs):
+                i = futs[fut]
+                (
+                    s,
+                    p0,
+                    p255,
+                    brightness_mean,
+                    brightness_weight,
+                    lap_feature,
+                    ten_feature,
+                    fft_feature,
+                    motion_factor,
+                    exposure_factor,
+                ) = fut.result()
+                scores[i] = s
+                p0_arr[i] = p0
+                p255_arr[i] = p255
+                brightness_mean_arr[i] = brightness_mean
+                brightness_arr[i] = brightness_weight
+                lap_arr[i] = lap_feature
+                ten_arr[i] = ten_feature
+                fft_arr[i] = fft_feature
+                motion_arr[i] = motion_factor
+                exposure_arr[i] = exposure_factor
+                completed += 1
+                last_pct = update_progress("Scoring", completed, n, last_pct)
 
-            combined *= motion_arr[idx]
-            combined *= exposure_arr[idx]
-            scores[idx] = combined
-    if n:
-        print(f"Scoring... 100% ({n}/{n})")
+        if args.enhance_motion and n > 1:
+            flow_pairs = []
+            prev_idx = None
+            for idx in range(n):
+                fp = files[idx]
+                if not os.path.isfile(fp):
+                    prev_idx = None
+                    continue
+                if prev_idx is not None:
+                    flow_pairs.append((prev_idx, idx))
+                prev_idx = idx
+            total_pairs = len(flow_pairs)
+            if flow_pairs:
+                completed_flow = 0
+                last_flow_pct = -1
+                with ThreadPoolExecutor(max_workers=workers) as flow_executor:
+                    flow_futs = {
+                        flow_executor.submit(
+                            _compute_pair_flow_magnitude,
+                            files[left_idx],
+                            files[right_idx],
+                            flow_crop_ratio,
+                        ): (left_idx, right_idx)
+                        for left_idx, right_idx in flow_pairs
+                    }
+                    for fut in as_completed(flow_futs):
+                        left_idx, right_idx = flow_futs[fut]
+                        try:
+                            mean_mag = fut.result()
+                        except Exception:
+                            mean_mag = FLOW_MISSING_HIGH_VALUE
+                        if mean_mag is None:
+                            mean_mag = FLOW_MISSING_HIGH_VALUE
+                        flow_mag_arr[right_idx] = max(flow_mag_arr[right_idx], mean_mag)
+                        flow_mag_arr[left_idx] = max(flow_mag_arr[left_idx], mean_mag)
+                        completed_flow += 1
+                        last_flow_pct = update_progress("Enhance motion", completed_flow, total_pairs, last_flow_pct)
+                print(f"Enhance motion... 100% ({total_pairs}/{total_pairs})")
+
+        if args.metric == "hybrid":
+            lap_values = np.array([v for v in lap_arr if v is not None], dtype=np.float64)
+            ten_values = np.array([v for v in ten_arr if v is not None], dtype=np.float64)
+            fft_values = np.array([v for v in fft_arr if v is not None], dtype=np.float64)
+
+            lap_values = [v for v in lap_arr if v is not None]
+            ten_values = [v for v in ten_arr if v is not None]
+            fft_values = [v for v in fft_arr if v is not None]
+
+            def _normalize_feature(values, value):
+                if not values or value is None:
+                    return 0.0
+                vmin = min(values)
+                vmax = max(values)
+                if math.isclose(vmax, vmin):
+                    return 0.0
+                return (value - vmin) / (vmax - vmin)
+
+            for idx in range(n):
+                if lap_arr[idx] is None:
+                    continue
+                lap_norm = _normalize_feature(lap_values, lap_arr[idx])
+                ten_norm = _normalize_feature(ten_values, ten_arr[idx])
+                fft_norm = _normalize_feature(fft_values, fft_arr[idx])
+
+                combined = (
+                    HYBRID_LAPVAR_WEIGHT * lap_norm
+                    + HYBRID_TENENGRAD_WEIGHT * ten_norm
+                    + HYBRID_FFT_WEIGHT * fft_norm
+                )
+
+                combined *= motion_arr[idx]
+                combined *= exposure_arr[idx]
+                scores[idx] = combined
+        if n:
+            print(f"Scoring... 100% ({n}/{n})")
     # Prepare optional CSV output
     csv_writer = None
     fcsv = None
@@ -1065,139 +1178,138 @@ def main():
                 "selected(1=keep)",
             ]
         )
-
-    # Grouping and relocation
-    total = n
-    group_infos = []
-    for grp_start in range(0, total, args.segment_size):
-        grp_end = min(total, grp_start + args.segment_size)
-        valid_idx = []
-        group_sum = 0.0
-        for i in range(grp_start, grp_end):
-            s = scores[i]
-            if s is None:
-                continue
-            valid_idx.append(i)
-            if s > 0.0:
-                brightness_factor = brightness_arr[i] * (max(brightness_mean_arr[i], 1e-6) ** GROUP_BRIGHTNESS_POWER)
-                group_sum += s * brightness_factor
-        for idx_in_group in range(grp_start, grp_end):
-            group_score_arr[idx_in_group] = group_sum
-        group_infos.append(
-            {
-                "start": grp_start,
-                "end": grp_end,
-                "valid_idx": valid_idx,
-                "group_sum": group_sum,
-            }
-        )
-
-    group_sums = [info["group_sum"] for info in group_infos if info["valid_idx"]]
-    low_threshold = None
-    if args.low_group_keep_ratio > 0.0:
-        if group_sums:
-            low_threshold = float(
-                np.percentile(group_sums, args.low_group_percentile)
+    if not args.apply_csv:
+        # Grouping and relocation
+        group_infos = []
+        for grp_start in range(0, total, args.segment_size):
+            grp_end = min(total, grp_start + args.segment_size)
+            valid_idx = []
+            group_sum = 0.0
+            for i in range(grp_start, grp_end):
+                s = scores[i]
+                if s is None:
+                    continue
+                valid_idx.append(i)
+                if s > 0.0:
+                    brightness_factor = brightness_arr[i] * (max(brightness_mean_arr[i], 1e-6) ** GROUP_BRIGHTNESS_POWER)
+                    group_sum += s * brightness_factor
+            for idx_in_group in range(grp_start, grp_end):
+                group_score_arr[idx_in_group] = group_sum
+            group_infos.append(
+                {
+                    "start": grp_start,
+                    "end": grp_end,
+                    "valid_idx": valid_idx,
+                    "group_sum": group_sum,
+                }
             )
-        else:
-            low_threshold = 0.0
 
-    initial_selected = set()
-    for info in group_infos:
-        grp_start = info["start"]
-        grp_end = info["end"]
-        group_range = range(grp_start, grp_end)
-        existing_indices = [
-            i for i in group_range if os.path.isfile(files[i])
-        ]
-        valid_indices = [
-            i for i in existing_indices if scores[i] is not None
-        ]
-
-        is_low_group = False
+        group_sums = [info["group_sum"] for info in group_infos if info["valid_idx"]]
+        low_threshold = None
         if args.low_group_keep_ratio > 0.0:
-            if not valid_indices:
-                is_low_group = True
-            elif (
-                low_threshold is None
-                or info["group_sum"] <= low_threshold
-            ):
-                is_low_group = True
-
-        if not valid_indices:
-            selected_indices = set(existing_indices)
-        else:
-            sorted_valid = sorted(
-                valid_indices,
-                key=lambda idx: (scores[idx], idx),
-                reverse=True,
-            )
-            keep_count = 1
-            if is_low_group:
-                raw_keep = round_half_up(
-                    len(sorted_valid) * args.low_group_keep_ratio
+            if group_sums:
+                low_threshold = float(
+                    np.percentile(group_sums, args.low_group_percentile)
                 )
-                desired = max(args.low_group_min_keep, raw_keep)
-                keep_count = min(len(sorted_valid), max(1, desired))
-
-            chosen = []
-            if args.allow_initial_adjacent:
-                chosen = sorted_valid[:keep_count]
             else:
-                for idx in sorted_valid:
-                    if not chosen:
-                        chosen.append(idx)
-                    elif min_diff <= 1 or all(abs(idx - sel) >= min_diff for sel in chosen):
-                        chosen.append(idx)
-                    if len(chosen) >= keep_count:
-                        break
-                if len(chosen) < keep_count:
+                low_threshold = 0.0
+
+        initial_selected = set()
+        for info in group_infos:
+            grp_start = info["start"]
+            grp_end = info["end"]
+            group_range = range(grp_start, grp_end)
+            existing_indices = [
+                i for i in group_range if os.path.isfile(files[i])
+            ]
+            valid_indices = [
+                i for i in existing_indices if scores[i] is not None
+            ]
+
+            is_low_group = False
+            if args.low_group_keep_ratio > 0.0:
+                if not valid_indices:
+                    is_low_group = True
+                elif (
+                    low_threshold is None
+                    or info["group_sum"] <= low_threshold
+                ):
+                    is_low_group = True
+
+            if not valid_indices:
+                selected_indices = set(existing_indices)
+            else:
+                sorted_valid = sorted(
+                    valid_indices,
+                    key=lambda idx: (scores[idx], idx),
+                    reverse=True,
+                )
+                keep_count = 1
+                if is_low_group:
+                    raw_keep = round_half_up(
+                        len(sorted_valid) * args.low_group_keep_ratio
+                    )
+                    desired = max(args.low_group_min_keep, raw_keep)
+                    keep_count = min(len(sorted_valid), max(1, desired))
+
+                chosen = []
+                if args.allow_initial_adjacent:
+                    chosen = sorted_valid[:keep_count]
+                else:
                     for idx in sorted_valid:
-                        if idx not in chosen:
+                        if not chosen:
+                            chosen.append(idx)
+                        elif min_diff <= 1 or all(abs(idx - sel) >= min_diff for sel in chosen):
                             chosen.append(idx)
                         if len(chosen) >= keep_count:
                             break
-            selected_indices = set(chosen)
+                    if len(chosen) < keep_count:
+                        for idx in sorted_valid:
+                            if idx not in chosen:
+                                chosen.append(idx)
+                            if len(chosen) >= keep_count:
+                                break
+                selected_indices = set(chosen)
 
-        initial_selected.update(selected_indices)
+            initial_selected.update(selected_indices)
 
-    existing_indices = [
-        i for i in range(total) if os.path.isfile(files[i])
-    ]
-    initial_selected &= set(existing_indices)
-    final_selected = evenly_distribute_indices(
-        existing_indices,
-        initial_selected,
-        scores,
-        min_diff,
-    )
-    if not final_selected and initial_selected:
-        final_selected = set(initial_selected)
-
-    gap_added_count = 0
-    before_gap_aug = set(final_selected)
-    final_selected = augment_spacing(
-        final_selected,
-        existing_indices,
-        scores,
-        initial_selected,
-        args.max_spacing,
-        min_diff,
-    )
-    gap_added_count = len(final_selected - before_gap_aug)
-
-    motion_added_count = 0
-    if args.enhance_motion:
-        before_motion_aug = set(final_selected)
-        final_selected = augment_motion_segments(
-            final_selected,
-            group_infos,
+        existing_indices = [
+            i for i in range(total) if os.path.isfile(files[i])
+        ]
+        initial_selected &= set(existing_indices)
+        final_selected = evenly_distribute_indices(
             existing_indices,
+            initial_selected,
             scores,
-            flow_mag_arr,
             min_diff,
         )
-        motion_added_count = len(final_selected - before_motion_aug)
+        if not final_selected and initial_selected:
+            final_selected = set(initial_selected)
+
+        gap_added_count = 0
+        before_gap_aug = set(final_selected)
+        final_selected = augment_spacing(
+            final_selected,
+            existing_indices,
+            scores,
+            initial_selected,
+            args.max_spacing,
+            min_diff,
+        )
+        gap_added_count = len(final_selected - before_gap_aug)
+
+        motion_added_count = 0
+        if args.enhance_motion:
+            before_motion_aug = set(final_selected)
+            final_selected = augment_motion_segments(
+                final_selected,
+                group_infos,
+                existing_indices,
+                scores,
+                flow_mag_arr,
+                min_diff,
+            )
+            motion_added_count = len(final_selected - before_motion_aug)
 
     kept = 0
     moved = 0
@@ -1205,8 +1317,13 @@ def main():
     processed = 0
     last_group_pct = -1
 
+
+
+
     for i in range(total):
         s = scores[i]
+        if args.apply_csv and s is None:
+            s = 0.0
         processed += 1
         file_exists = os.path.isfile(files[i])
         if not file_exists or s is None:
@@ -1281,3 +1398,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
