@@ -1,6 +1,6 @@
 # 360-RealityScan-Postshot-Tools
 
-A toolkit for processing and optimizing **360 camera scans** captured with RealityScan, preparing them for **PostShot/3DGS** workflows.
+A toolkit for processing and optimizing **360 Camera 3DGS Scans** aligned with RealityScan, preparing them for **PostShot/3DGS** workflows.
 
 ---
 
