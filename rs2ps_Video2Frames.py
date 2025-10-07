@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import argparse
@@ -225,14 +225,14 @@ def main() -> None:
         help='Optional end time in seconds.',
     )
     ap.add_argument(
+        '--keep-rec709',
+        action='store_true',
+        help='Keep Rec.709 transfer characteristics instead of converting to sRGB.',
+    )
+    ap.add_argument(
         '--overwrite',
         action='store_true',
         help='Overwrite output if it already exists.',
-    )
-    ap.add_argument(
-        '--use-pts',
-        action='store_true',
-        help='Use presentation timestamps for filenames.',
     )
     args = ap.parse_args()
 
@@ -277,18 +277,15 @@ def main() -> None:
     out_bit_depth = 8 if inferred_bits <= 8 else 16
 
     vf_chain = [f'fps={args.fps}']
+    colorspace_filter = 'colorspace=iall=bt709:all=smpte170m'
+    if not args.keep_rec709:
+        colorspace_filter += ':trc=iec61966-2-1'
     if ext in {'jpg', 'jpeg'}:
         # Keep JPEG outputs in 4:4:4 and match the expected color space.
-        vf_chain.append(
-            'colorspace=iall=bt709:all=smpte170m:'
-            'trc=iec61966-2-1:range=jpeg:format=yuv444p'
-        )
+        vf_chain.append(f'{colorspace_filter}:range=jpeg:format=yuv444p')
     else:
         # Normalize other outputs to the expected BT.709 color space.
-        vf_chain.append(
-            'colorspace=iall=bt709:all=smpte170m:'
-            'trc=iec61966-2-1:format=yuv444p'
-        )
+        vf_chain.append(f'{colorspace_filter}:format=yuv444p')
 
     cmd = ['ffmpeg', '-hide_banner', '-y' if args.overwrite else '-n']
     if args.start is not None:
@@ -331,10 +328,7 @@ def main() -> None:
         else:
             cmd += ['-pix_fmt', 'rgb48le']
 
-    if args.use_pts:
-        cmd += ['-vsync', 'vfr', '-frame_pts', '1', str(pattern)]
-    else:
-        cmd += ['-vsync', 'vfr', '-start_number', '0', str(pattern)]
+    cmd += ['-vsync', 'vfr', '-start_number', '0', str(pattern)]
 
     media_duration = probe_media_duration(in_path)
     start_offset = max(float(args.start or 0.0), 0.0)
