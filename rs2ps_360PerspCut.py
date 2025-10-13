@@ -268,12 +268,13 @@ def main():
         help="Output folder. Defaults to <input>/_geometry if omitted")
 
     ap.add_argument("--preset",
-        choices=["default","10views","defaultXY","evenMinus30","evenPlus30"], default="default",
+        choices=["default","2views","10views","evenMinus30","evenPlus30","fisheyeXY"], default="default",
         help=("default=8-view baseline / "
+              "2views=front/back only (6mm focal, 3600px) / "
               "10views=baseline + top/bottom (10 total views) / "
-              "defaultXY=fisheye X/Y pair only (Equisolid 3600px FOV180) / "
               "evenMinus30=even slots pitch -30deg / "
-              "evenPlus30=even slots pitch +30deg"))
+              "evenPlus30=even slots pitch +30deg / "
+              "fisheyeXY=fisheye X/Y pair only (Equisolid 3600px FOV180)"))
 
     ap.add_argument("--count", type=int, default=8, help="Horizontal division count (4=90deg, 8=45deg)")
 
@@ -292,8 +293,6 @@ def main():
     # geometry / output
     ap.add_argument("--size", type=int, default=1600, help="Square output size per view")
     ap.add_argument("--ext", default="jpg", help="Output extension (jpg=high quality mjpeg)")
-    ap.add_argument("--interp", choices=["lanczos","bicubic","bilinear"], default="bicubic",
-        help="Interpolation method (mapped to v360: bicubic->cubic, bilinear->linear)")
     ap.add_argument("--hfov", type=float, default=None, help="Horizontal FOV in degrees (overrides focal length)")
     ap.add_argument("--focal-mm", type=float, default=12.0, help="Focal length in millimetres when --hfov is not set")
     ap.add_argument("--sensor-mm", default="36 36", help="Sensor width/height in millimetres, e.g. '36 36' or '36x24'")
@@ -316,18 +315,23 @@ def main():
     if not files:
         print("[WARN] No target images found (tif/jpg/png)", file=sys.stderr); sys.exit(0)
 
+    size_explicit = any(arg == "--size" or arg.startswith("--size=") for arg in sys.argv[1:])
+    hfov_explicit = any(arg == "--hfov" or arg.startswith("--hfov=") for arg in sys.argv[1:])
+    focal_explicit = any(arg == "--focal-mm" or arg.startswith("--focal-mm=") for arg in sys.argv[1:])
+
     # ---- preset handling (pitch adjustments only) ----
     even_pitch_all = None
     even_pitch_map: Dict[int, float] = {}
 
     add_topdown = bool(args.add_topdown)
-    preset_xy_fisheye = (args.preset == "defaultXY")
+    preset_fisheye_xy = (args.preset == "fisheyeXY")
+    preset_two_views = (args.preset == "2views")
 
     if args.preset == "10views":
         add_topdown = True
-    elif preset_xy_fisheye:
+    elif preset_fisheye_xy:
         if args.count != 8:
-            print("[INFO] preset 'defaultXY' forces count=8")
+            print("[INFO] preset 'fisheyeXY' forces count=8")
         args.count = 8
     elif args.preset == "evenMinus30" and even_pitch_all is None:
         even_pitch_all = -30.0
@@ -335,9 +339,17 @@ def main():
         even_pitch_all = +30.0
     preset_extra_even_pitches = []
 
+    if preset_two_views and not size_explicit:
+        args.size = 3600
+    if preset_two_views and not hfov_explicit and not focal_explicit:
+        args.focal_mm = 6.0
+
     # add/del/setcam parsing
     add_map = parse_addcam_spec(args.addcam, args.addcam_deg)   # idx1 -> [delta_pitch,...]
     del_set = parse_delcam_spec(args.delcam)                    # idx1 set
+    if preset_two_views:
+        for ch in ("B","C","D","F","G","H"):
+            del_set.add(letter_to_index1(ch))
     set_abs_map, set_delta_map = parse_setcam_spec(args.setcam, args.addcam_deg if hasattr(args, "addcam_deeg") else args.addcam_deg)
 
     # ---- FOV / size / derived values ----
@@ -353,10 +365,7 @@ def main():
     w = h = base_size
     vfov_deg = v_fov_from_hfov(hfov_deg, w, h)
 
-    size_explicit = any(arg == "--size" or arg.startswith("--size=") for arg in sys.argv[1:])
-    hfov_explicit = any(arg == "--hfov" or arg.startswith("--hfov=") for arg in sys.argv[1:])
-
-    if preset_xy_fisheye:
+    if preset_fisheye_xy:
         fisheye_size = base_size if size_explicit else 3600
         fisheye_fov_deg = hfov_deg if hfov_explicit else 180.0
     else:
@@ -371,7 +380,7 @@ def main():
 
     ffmpeg = args.ffmpeg
     ext_dot = "." + args.ext.lower().lstrip(".")
-    interp_v360 = map_interp_for_v360(args.interp)
+    interp_v360 = map_interp_for_v360("bicubic")
 
     def extra_suffix(delta_pitch: float, default_deg: float=30.0) -> str:
         sign = "_U" if delta_pitch > 0 else "_D"
@@ -385,7 +394,7 @@ def main():
 
     jobs_list: List[Tuple[List[str], str, str]] = []
     existing_names: Set[str] = set()  # prevent duplicate jobs
-    fisheye_letter_map = {1: "X", 5: "Y"} if preset_xy_fisheye else {}
+    fisheye_letter_map = {1: "X", 5: "Y"} if preset_fisheye_xy else {}
 
     for img in files:
         stem = img.stem
@@ -397,13 +406,13 @@ def main():
             tag = letter_tag(yi)
 
             # Skip baseline output when camera is deleted or preset suppresses it
-            skip_base = (idx1 in del_set) or preset_xy_fisheye
+            skip_base = (idx1 in del_set) or preset_fisheye_xy
 
             yaw = normalize_angle_deg(yi * yaw_step)
 
             # ---- Base view adjustments (preset -> setcam) ----
             pitch = base_pitch0
-            if (idx1 % 2) == 0 and not preset_xy_fisheye:
+            if (idx1 % 2) == 0 and not preset_fisheye_xy:
                 if even_pitch_all is not None: pitch += float(even_pitch_all)
                 if idx1 in even_pitch_map:     pitch += float(even_pitch_map[idx1])
 
@@ -414,7 +423,7 @@ def main():
                 pitch += float(set_delta_map[idx1])
 
             pitch = clamp(pitch, -90.0, 90.0)
-            if preset_xy_fisheye and idx1 in fisheye_letter_map:
+            if preset_fisheye_xy and idx1 in fisheye_letter_map:
                 xy_views.append((fisheye_letter_map[idx1], yaw, pitch))
 
             # 1) Baseline image (skipped when requested)
@@ -439,7 +448,7 @@ def main():
                         existing_names.add(out_path2.name)
 
             # 3) User-specified additions (applied regardless of --delcam)
-            if not preset_xy_fisheye and idx1 in add_map:
+            if not preset_fisheye_xy and idx1 in add_map:
                 for d in add_map[idx1]:
                     p3 = clamp(pitch + d, -90.0, 90.0)
                     suf3 = extra_suffix(d, args.addcam_deg)
@@ -452,7 +461,7 @@ def main():
 
 
 
-        if preset_xy_fisheye:
+        if preset_fisheye_xy:
             for xy_tag, yaw_xy, pitch_xy in xy_views:
                 out_path_xy = out_dir / f"{stem}_{xy_tag}{ext_dot}"
                 if out_path_xy.name in existing_names:
@@ -501,7 +510,7 @@ def main():
                 f"[INFO] View summary ({first_src}): "
                 + ", ".join(seen_views)
             )
-            if preset_xy_fisheye:
+            if preset_fisheye_xy:
                 preview_views_line += f" | fisheye_fov={fisheye_fov_deg:.1f}deg | size={fisheye_size}x{fisheye_size}"
             else:
                 preview_views_line += f" | focal={f_used_mm:.3f}mm | sensor={args.sensor_mm} mm | size={w}x{h}"
