@@ -221,6 +221,11 @@ def main() -> None:
         help='Output image extension (e.g. jpg, png). Defaults to jpg.',
     )
     ap.add_argument(
+        '--prefix',
+        default='out',
+        help='Filename prefix for extracted frames (default: out).',
+    )
+    ap.add_argument(
         '--start',
         type=float,
         default=0.0,
@@ -235,7 +240,7 @@ def main() -> None:
     ap.add_argument(
         '--keep-rec709',
         action='store_true',
-        help='Keep Rec.709 transfer characteristics instead of converting to sRGB.',
+        help='Keep Rec.709 characteristics instead of converting to sRGB.',
     )
     ap.add_argument(
         '--overwrite',
@@ -279,7 +284,11 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ext = args.ext.lstrip('.').lower()
-    pattern = out_dir / f'out_%07d.{ext}'
+    frame_prefix = (args.prefix or 'out').strip()
+    frame_prefix = re.sub(r'\s+', '_', frame_prefix) if frame_prefix else 'out'
+    if not frame_prefix:
+        frame_prefix = 'out'
+    pattern = out_dir / f'{frame_prefix}_%07d.{ext}'
 
     inferred_bits = detect_input_bit_depth(in_path)
     out_bit_depth = 8 if inferred_bits <= 8 else 16
