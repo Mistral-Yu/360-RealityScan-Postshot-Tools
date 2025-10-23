@@ -1,0 +1,4 @@
+numpy>=1.24
+opencv-python>=4.8
+Pillow>=9.0
+plyfile>=0.8

@@ -1,52 +1,109 @@
 # 360-RealityScan-Postshot-Tools
 
-A toolkit for processing and optimizing **360 Camera 3DGS Scans** aligned with RealityScan, preparing them for **PostShot/3DGS** workflows.
+A consolidated toolkit for turning 360° video captures into RealityScan-friendly datasets and optimized point clouds that seed PostShot/3D Gaussian Splatting (3DGS) projects. The scripts cover every stage from frame extraction to PLY refinement, and the desktop GUI orchestrates the full flow.
 
 ---
 
-## Overview
-
-RealityScan outputs raw PLY point clouds and 360° images/videos which often need cleaning, optimization, 
-and alignment before they can be effectively used in PostShot or other 3D Gaussian Splatting pipelines. 
-The tools in this repo cover the typical preprocessing steps for **360° camera-based scanning**:
-
-Together, they allow for a smoother end-to-end pipeline.
-
----
-
-## Tools
-
-* **rs2ps_Video2Frames**: Extracting 360° images from 360° videos
-* **rs2ps_FrameSelector**: Selecting suitable frames from 360° image sequences for SfM/3DGS
-* **rs2ps_360PerspCut**: Cutting perspective images from 360° equirectangular images
-* **rs2ps_PlyOptimizer**: Point cloud optimization. Downsampling, merging, and optimizing PLY point clouds — initialization point clouds for 3DGS, exported from RealityScan
-
----
-
-## rs2ps_PlyOptimizer
-
-A small utility to **optimize PLY point clouds from RealityScan for PostShot/3DGS**. Supports XYZ/RGB loading, **voxel downsampling (fixed size / target points)**, **appending multiple PLY files**, and **binary (little-endian) PLY export**.
-
-### Features
-
-* **Robust PLY (XYZ+RGB) loading**
-* **Statistics reporting** (point count, AABB, volume, etc.)
-* **Downsampling** (fixed voxel size / target points / percent ratio)
-* **Appending multiple PLY files**
-* **Binary little-endian output** (fast & compact)
+## Installation & Environment Setup
 
 ### Requirements
+- Python **3.9** or newer
+- `pip` for installing Python packages
+- [FFmpeg](https://ffmpeg.org/) and `ffprobe` available on your `PATH`
+- A GPU is not required, but fast storage/CPU cores benefit multi-threaded exports
 
-* Python **3.7**
-* `numpy`, `plyfile`
+### Setup Steps
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/your-org/360-RealityScan-Postshot-Tools.git
+   cd 360-RealityScan-Postshot-Tools
+   ```
+2. **(Optional) create a virtual environment**
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate  # Windows: .venv\Scripts\activate
+   ```
+3. **Install Python dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. **Verify FFmpeg**
+   ```bash
+   ffmpeg -version
+   ffprobe -version
+   ```
 
-### Usage (CLI)
+---
+
+## Workflow at a Glance
+1. Sample equirectangular frames from a 360° video.
+2. Score and retain the sharpest frames for Structure-from-Motion (SfM).
+3. Convert panoramas into perspective/fisheye views.
+4. Reconstruct with RealityScan and export the PLY point cloud plus camera data.
+5. Downsample/merge the PLY for PostShot initialization and feed both assets into your 3DGS pipeline.
+
+The **rs2ps_360GUI** provides a launch pad for each CLI stage, letting you preview perspective camera layouts and run exports without memorising command-line options.
+
+---
+
+## Toolchain Overview
+
+### rs2ps_360GUI (Desktop Launcher)
+Tkinter/Pillow interface that wraps `rs2ps_360PerspCut` and the other scripts. It previews camera rigs, edits presets, triggers FFmpeg jobs, and exposes context help for every option.
+
+Launch the GUI:
+```bash
+python rs2ps_360GUI.py --input-dir path/to/frames
+```
+Use the tabs to:
+- Preview and tweak perspective camera layouts before exporting.
+- Kick off frame extraction, sharp-frame selection, and perspective cuts with your saved presets.
+- Run PLY downsampling once RealityScan reconstruction is complete.
+
+### CLI Stage 1: rs2ps_Video2Frames
+Sample frames from 360° footage at controllable frame rates, automatically normalising colour space/bit depth and handling time-range trimming.
 
 ```bash
-rs2ps_PlyOptimizer -i input.ply -o output.ply --target-points 500000
+python rs2ps_Video2Frames.py \
+    --input path/to/video.mp4 \
+    --output-dir frames/360_raw \
+    --fps 2
 ```
 
+### CLI Stage 2: rs2ps_FrameSelector
+Rank and filter equirectangular stills using hybrid sharpness metrics (Laplacian, Tenengrad, FFT) with segment-based quotas, brightness/motion guards, and optional CSV round-tripping.
+
+```bash
+python rs2ps_FrameSelector.py \
+    --input-dir frames/360_raw \
+    --output-dir frames/360_selected \
+    --segment-size 50 --select-per-segment 5
+```
+
+### CLI Stage 3: rs2ps_360PerspCut
+Convert panoramas or selected frames into perspective/fisheye outputs using presets or ad-hoc camera definitions, with multi-process FFmpeg execution and graceful cancellation.
+
+```bash
+python rs2ps_360PerspCut.py \
+    --input-dir frames/360_selected \
+    --output-dir frames/perspective \
+    --preset default --size 2048 --jobs auto
+```
+
+### CLI Stage 4: rs2ps_PlyOptimizer
+Prepare RealityScan PLY point clouds for PostShot/3DGS by reporting statistics, voxel-downsampling to a target point count, optionally merging additional clouds, and exporting binary little-endian files.
+
+```bash
+python rs2ps_PlyOptimizer.py \
+    --input realityscan_output.ply \
+    --output optimized.ply \
+    --target-points 500000
+```
+
+Feed the optimised PLY and RealityScan camera bundle into PostShot to finish the 3DGS pipeline.
+
+---
 
 ## License
 
-* (To be defined according to the project)
+(To be defined according to the project.)
