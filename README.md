@@ -7,7 +7,7 @@ A consolidated toolkit for turning 360° video captures into RealityScan-friendl
 ## Installation & Environment Setup
 
 ### Requirements
-- Python **3.9** or newer
+- Python **3.7** or newer
 - `pip` for installing Python packages
 - [FFmpeg](https://ffmpeg.org/) and `ffprobe` available on your `PATH`
 - A GPU is not required, but fast storage/CPU cores benefit multi-threaded exports
