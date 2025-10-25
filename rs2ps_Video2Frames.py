@@ -247,11 +247,17 @@ def main() -> None:
         action='store_true',
         help='Overwrite output if it already exists.',
     )
+    ap.add_argument(
+        '--ffmpeg',
+        default='ffmpeg',
+        help='Path to the ffmpeg executable (default: ffmpeg).',
+    )
     args = ap.parse_args()
 
-    if not shutil.which('ffmpeg'):
+    ffmpeg_exec = args.ffmpeg or 'ffmpeg'
+    if not shutil.which(ffmpeg_exec):
         print(
-            'ffmpeg was not found. Please ensure it is on PATH.',
+            f'ffmpeg executable not found: {ffmpeg_exec}',
             file=sys.stderr,
         )
         sys.exit(1)
@@ -304,7 +310,7 @@ def main() -> None:
         # Normalize other outputs to the expected BT.709 color space.
         vf_chain.append(f'{colorspace_filter}:format=yuv444p')
 
-    cmd = ['ffmpeg', '-hide_banner', '-y' if args.overwrite else '-n']
+    cmd = [ffmpeg_exec, '-hide_banner', '-y' if args.overwrite else '-n']
     if args.start is not None:
         cmd += ['-ss', str(args.start)]
 
