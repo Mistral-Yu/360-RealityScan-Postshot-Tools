@@ -12,7 +12,8 @@ A consolidated toolkit for turning 360° video captures into RealityScan-friendl
 - Python **3.7** or newer
 - `pip` for installing Python packages
 - [FFmpeg](https://ffmpeg.org/) and `ffprobe` available on your `PATH`
-- A GPU is not required, but fast storage/CPU cores benefit multi-threaded exports
+- [PyTorch](https://pytorch.org/get-started/locally/) (`torch` **1.10+** and matching `torchvision` build) for the human masking tool
+- A GPU is not required, but fast storage/CPU cores benefit multi-threaded exports. CUDA acceleration is optional for masking but speeds up large batches.
 
 ### Setup Steps
 1. **Clone the repository**
@@ -29,6 +30,7 @@ A consolidated toolkit for turning 360° video captures into RealityScan-friendl
    ```bash
    pip install -r requirements.txt
    ```
+   > **Note:** PyTorch wheels are platform-specific. If `pip` cannot find a build for your OS/Python combo, follow the [official selector](https://pytorch.org/get-started/locally/) and install `torch`/`torchvision` manually before rerunning the command.
 4. **Verify FFmpeg**
    ```bash
    ffmpeg -version
@@ -40,9 +42,10 @@ A consolidated toolkit for turning 360° video captures into RealityScan-friendl
 ## Workflow at a Glance
 1. Sample equirectangular frames from a 360° video.
 2. Score and retain the sharpest frames for Structure-from-Motion (SfM).
-3. Convert panoramas into perspective/fisheye views.
-4. Align in RealityScan and export the PLY point cloud plus camera data.
-5. Downsample/merge the PLY for PostShot initialization and feed both assets into your 3DGS pipeline.
+3. *(Optional)* Remove or isolate bystanders with `rs2ps_HumanMaskTool` to avoid reconstruction ghosts.
+4. Convert panoramas into perspective/fisheye views.
+5. Align in RealityScan and export the PLY point cloud plus camera data.
+6. Downsample/merge the PLY for PostShot initialization and feed both assets into your 3DGS pipeline.
 
 ### Recommended RealityScan-to-PostShot Flow
 - After RealityScan completes **Reconstruction** and **Colorize**, export the colourised mesh as a PLY and grab the accompanying camera **CSV** (not the Bundler bundle); that pairing feeds best into `rs2ps_PlyOptimizer`.
@@ -64,50 +67,10 @@ The **rs2ps_360GUI** provides a launch pad for each CLI stage, letting you previ
   - Example: `python rs2ps_360PerspCut.py --input-dir frames/360_selected --output-dir frames/perspective --preset default --size 2048 --jobs auto`
 - **rs2ps_PlyOptimizer** — Prepares RealityScan PLY point clouds (exported after the **Reconstruction → Colorize → PLY** sequence) for PostShot/3DGS by reporting statistics, voxel-downsampling to a target point count, optionally merging additional clouds, and exporting binary little-endian files. Its voxel-based strategy is ideal when you need a uniform detail distribution before pushing splats into 3DGS.
   - Example: `python rs2ps_PlyOptimizer.py --input realityscan_output.ply --output optimized.ply --target-points 100000`
+- **rs2ps_HumanMaskTool** — Batch-detects people with Mask R-CNN to generate binary mattes, RGBA cut-outs, or inpainted plates before photogrammetry. Supports optional CUDA inference and shadow expansion to keep reflected silhouettes intact.
+  - Example: `python rs2ps_HumanMaskTool.py --in frames/360_selected --mode alpha --include_shadow`
 
 Feed the optimised PLY and RealityScan camera CSV into PostShot to finish the 3DGS pipeline.
-
----
-
-## Installation & Environment Setup
-
-### Requirements
-- Python **3.7** or newer
-- `pip` for installing Python packages
-- [FFmpeg](https://ffmpeg.org/) and `ffprobe` available on your `PATH`
-- A GPU is not required, but fast storage/CPU cores benefit multi-threaded exports
-
-### Setup Steps
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/your-org/360-RealityScan-Postshot-Tools.git
-   cd 360-RealityScan-Postshot-Tools
-   ```
-2. **(Optional) create a virtual environment**
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # Windows: .venv\Scripts\activate
-   ```
-3. **Install Python dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. **Verify FFmpeg**
-   ```bash
-   ffmpeg -version
-   ffprobe -version
-   ```
-
----
-
-## Workflow at a Glance
-1. Sample equirectangular frames from a 360° video.
-2. Score and retain the sharpest frames for Structure-from-Motion (SfM).
-3. Convert panoramas into perspective/fisheye views.
-4. Reconstruct with RealityScan and export the PLY point cloud plus camera data.
-5. Downsample/merge the PLY for PostShot initialization and feed both assets into your 3DGS pipeline.
-
-The **rs2ps_360GUI** provides a launch pad for each CLI stage, letting you preview perspective camera layouts and run exports without memorising command-line options.
 
 ---
 
@@ -154,6 +117,21 @@ python rs2ps_360PerspCut.py \
     --output-dir frames/perspective \
     --preset default --size 2048 --jobs auto
 ```
+
+### Optional Masking: rs2ps_HumanMaskTool
+Remove or isolate people before reconstruction by generating mattes, alpha cut-outs, or inpainted plates. The script scans a directory (non-recursive) with Mask R-CNN and writes results to an `_mask/` folder unless `--out` is provided.
+
+```bash
+python rs2ps_HumanMaskTool.py \
+    --in frames/360_selected \
+    --mode keep_person \
+    --include_shadow
+```
+
+Tips:
+- Switch `--mode` between `mask`, `alpha`, `cutout`, `keep_person`, `remove_person`, and `inpaint` depending on the downstream need.
+- Add `--cpu` if CUDA is unavailable; GPU inference is automatically used when possible.
+- Use `--dilate 1.5` (percent) to slightly grow masks and avoid halos, or pair with `--include_shadow` to capture nearby shadows/reflections.
 
 ### CLI Stage 4: rs2ps_PlyOptimizer
 Prepare RealityScan PLY point clouds for PostShot/3DGS by reporting statistics, voxel-downsampling to a target point count, optionally merging additional clouds, and exporting binary little-endian files.
