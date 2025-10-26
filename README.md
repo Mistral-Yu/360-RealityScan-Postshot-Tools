@@ -42,8 +42,8 @@ A consolidated toolkit for turning 360° video captures into RealityScan-friendl
 ## Workflow at a Glance
 1. Sample equirectangular frames from a 360° video.
 2. Score and retain the sharpest frames for Structure-from-Motion (SfM).
-3. *(Optional)* Remove or isolate bystanders with `rs2ps_HumanMaskTool` to avoid reconstruction ghosts.
-4. Convert panoramas into perspective/fisheye views.
+3. Convert panoramas into perspective/fisheye views.
+4. *(Optional)* Remove or isolate bystanders with `rs2ps_HumanMaskTool` to avoid reconstruction ghosts.
 5. Align in RealityScan and export the PLY point cloud plus camera data.
 6. Downsample/merge the PLY for PostShot initialization and feed both assets into your 3DGS pipeline.
 
