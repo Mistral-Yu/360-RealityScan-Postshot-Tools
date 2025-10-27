@@ -540,6 +540,7 @@ class PreviewApp:
         self.ply_log: Optional[tk.Text] = None
         self.ply_run_button: Optional[tk.Button] = None
         self.ply_append_text: Optional[tk.Text] = None
+        self.ply_adaptive_weight_entry: Optional[tk.Entry] = None
 
         self.video_stop_button: Optional[tk.Button] = None
         self.selector_stop_button: Optional[tk.Button] = None
@@ -1051,8 +1052,11 @@ class PreviewApp:
             "target_points": tk.StringVar(),
             "target_percent": tk.StringVar(),
             "voxel_size": tk.StringVar(),
+            "adaptive": tk.BooleanVar(value=False),
+            "adaptive_weight": tk.StringVar(value="1.0"),
             "keep_strategy": tk.StringVar(value="centroid"),
         }
+        self.ply_vars["adaptive"].trace_add("write", self._update_ply_adaptive_state)
 
         row = 0
         tk.Label(params, text="Input PLY").grid(row=row, column=0, sticky="e", padx=4, pady=4)
@@ -1081,6 +1085,23 @@ class PreviewApp:
         tk.Entry(numbers_frame, textvariable=self.ply_vars["target_percent"], width=10).pack(side=tk.LEFT, padx=(0, 12))
         tk.Label(numbers_frame, text="Voxel size").pack(side=tk.LEFT, padx=(0, 4))
         tk.Entry(numbers_frame, textvariable=self.ply_vars["voxel_size"], width=10).pack(side=tk.LEFT, padx=(0, 4))
+
+        row += 1
+        adaptive_frame = tk.Frame(params)
+        adaptive_frame.grid(row=row, column=0, columnspan=3, sticky="we", pady=4)
+        tk.Checkbutton(
+            adaptive_frame,
+            text="Adaptive sampling",
+            variable=self.ply_vars["adaptive"],
+            command=self._update_ply_adaptive_state,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        tk.Label(adaptive_frame, text="Weight").pack(side=tk.LEFT, padx=(0, 4))
+        self.ply_adaptive_weight_entry = tk.Entry(
+            adaptive_frame,
+            textvariable=self.ply_vars["adaptive_weight"],
+            width=8,
+        )
+        self.ply_adaptive_weight_entry.pack(side=tk.LEFT, padx=(0, 4))
 
         row += 1
         tk.Label(params, text="Keep strategy").grid(row=row, column=0, sticky="e", padx=4, pady=4)
@@ -1116,6 +1137,7 @@ class PreviewApp:
         self.ply_log.bind("<Key>", self._block_text_edit)
         self.ply_log.bind("<Button-1>", lambda event: self.ply_log.focus_set())
         self._set_text_widget(self.ply_log, "")
+        self._update_ply_adaptive_state()
 
     def _build_preview_tab(self, parent: tk.Widget) -> None:
         main = tk.Frame(parent)
@@ -1705,6 +1727,18 @@ class PreviewApp:
             cwd=self.base_dir,
         )
 
+    def _update_ply_adaptive_state(self, *_args) -> None:
+        entry = self.ply_adaptive_weight_entry
+        if entry is None:
+            return
+        adaptive_var = self.ply_vars.get("adaptive")
+        active = bool(adaptive_var.get()) if adaptive_var is not None else False
+        state = "normal" if active else "disabled"
+        try:
+            entry.configure(state=state)
+        except tk.TclError:
+            pass
+
     def _run_ply_optimizer(self) -> None:
         if not self.ply_vars:
             return
@@ -1750,6 +1784,18 @@ class PreviewApp:
                 messagebox.showerror("rs2ps_PlyOptimizer", "Voxel size must be numeric.")
                 return
             cmd.extend(["-v", voxel_size])
+
+        adaptive_enabled = bool(self.ply_vars["adaptive"].get())
+        if adaptive_enabled:
+            cmd.append("--adaptive")
+            weight_text = self.ply_vars["adaptive_weight"].get().strip()
+            if weight_text:
+                try:
+                    float(weight_text)
+                except ValueError:
+                    messagebox.showerror("rs2ps_PlyOptimizer", "Adaptive weight must be numeric.")
+                    return
+                cmd.extend(["--adaptive-weight", weight_text])
 
         keep_strategy = self.ply_vars["keep_strategy"].get().strip()
         if keep_strategy:
