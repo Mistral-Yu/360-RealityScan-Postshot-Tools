@@ -852,10 +852,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.target_points is not None and args.target_points <= 0:
         ap.error("--target-points must be greater than 0")
 
-    if args.adaptive and args.keep_strategy != "random":
-        print("[adaptive] forcing keep-strategy=random")
-        args.keep_strategy = "random"
-
     base_path = os.path.expanduser(args.input)
     if not os.path.isabs(base_path):
         base_path = os.path.abspath(base_path)
