@@ -412,14 +412,13 @@ def score_one_file(
                 + HYBRID_FFT_WEIGHT * fft_score
             )
 
-            motion_ratio = ten_score / (ten_score + HYBRID_MOTION_REFERENCE)
-            motion_ratio = max(0.0, min(1.0, motion_ratio))
-            motion_factor = 1.0 - HYBRID_MOTION_PENALTY_WEIGHT * (1.0 - motion_ratio)
-            motion_factor = max(0.0, motion_factor)
-
-        if augment_motion:
-            # Motion-sensitive enhancement is now handled during post-selection augmentation.
-            pass
+            if augment_motion:
+                motion_ratio = ten_score / (ten_score + HYBRID_MOTION_REFERENCE)
+                motion_ratio = max(0.0, min(1.0, motion_ratio))
+                motion_factor = 1.0 - HYBRID_MOTION_PENALTY_WEIGHT * (1.0 - motion_ratio)
+                motion_factor = max(0.0, motion_factor)
+            else:
+                motion_factor = 1.0
 
             if brightness_mean < HYBRID_DARK_THRESHOLD:
                 dark_ratio = brightness_mean / HYBRID_DARK_THRESHOLD
@@ -431,7 +430,7 @@ def score_one_file(
 
             sharp = hybrid_raw * motion_factor
         else:
-            return None, 0.0, 0.0, brightness_mean, brightness_weight, None, None, None, 1.0
+            motion_factor = 1.0
 
         p0, p255 = 0.0, 0.0
 
