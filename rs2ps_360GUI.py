@@ -3,16 +3,17 @@
 """GUI preview and execution tool for rs2ps_360PerspCut."""
 
 import argparse
+import csv
 import copy
 import itertools
 import math
-import pathlib                                                                                                                                                                                                                                          
+import pathlib
 from pathlib import Path
 import re
 import shlex
 import subprocess
 import sys
-import tempfile                                                                                                                          
+import tempfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -531,6 +532,7 @@ class PreviewApp:
         self.selector_vars: Dict[str, tk.Variable] = {}
         self.selector_log: Optional[tk.Text] = None
         self.selector_run_button: Optional[tk.Button] = None
+        self.selector_show_score_button: Optional[tk.Button] = None
 
         self.human_vars: Dict[str, tk.Variable] = {}
         self.human_log: Optional[tk.Text] = None
@@ -541,6 +543,7 @@ class PreviewApp:
         self.ply_run_button: Optional[tk.Button] = None
         self.ply_append_text: Optional[tk.Text] = None
         self.ply_adaptive_weight_entry: Optional[tk.Entry] = None
+        self.ply_keep_menu: Optional[tk.OptionMenu] = None
 
         self.video_stop_button: Optional[tk.Button] = None
         self.selector_stop_button: Optional[tk.Button] = None
@@ -926,6 +929,18 @@ class PreviewApp:
             command=self._run_frame_selector,
         )
         self.selector_run_button.pack(side=tk.RIGHT, padx=4, pady=4)
+        self.selector_count_var = tk.StringVar(value="20")
+        count_entry = tk.Entry(actions, textvariable=self.selector_count_var, width=6)
+        count_entry.pack(side=tk.LEFT, padx=(4, 0), pady=4)
+        count_entry.insert(0, "")
+        if not self.selector_count_var.get():
+            self.selector_count_var.set("20")
+        self.selector_show_score_button = tk.Button(
+            actions,
+            text="Fetch Sharpness Scores From CSV",
+            command=self._show_selector_scores,
+        )
+        self.selector_show_score_button.pack(side=tk.LEFT, padx=(4, 4), pady=4)
 
         log_frame = tk.LabelFrame(container, text="Log")
         log_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -1105,7 +1120,15 @@ class PreviewApp:
 
         row += 1
         tk.Label(params, text="Keep strategy").grid(row=row, column=0, sticky="e", padx=4, pady=4)
-        tk.OptionMenu(params, self.ply_vars["keep_strategy"], "centroid", "center", "first", "random").grid(row=row, column=1, sticky="w", padx=4, pady=4)
+        self.ply_keep_menu = tk.OptionMenu(
+            params,
+            self.ply_vars["keep_strategy"],
+            "centroid",
+            "center",
+            "first",
+            "random",
+        )
+        self.ply_keep_menu.grid(row=row, column=1, sticky="w", padx=4, pady=4)
 
         params.grid_columnconfigure(1, weight=1)
 
@@ -1728,16 +1751,15 @@ class PreviewApp:
         )
 
     def _update_ply_adaptive_state(self, *_args) -> None:
-        entry = self.ply_adaptive_weight_entry
-        if entry is None:
-            return
         adaptive_var = self.ply_vars.get("adaptive")
         active = bool(adaptive_var.get()) if adaptive_var is not None else False
-        state = "normal" if active else "disabled"
-        try:
-            entry.configure(state=state)
-        except tk.TclError:
-            pass
+        entry = self.ply_adaptive_weight_entry
+        if entry is not None:
+            state = "normal" if active else "disabled"
+            try:
+                entry.configure(state=state)
+            except tk.TclError:
+                pass
 
     def _run_ply_optimizer(self) -> None:
         if not self.ply_vars:
@@ -1899,6 +1921,87 @@ class PreviewApp:
             )
         if path:
             self.selector_vars["csv_path"].set(path)
+
+    def _show_selector_scores(self) -> None:
+        if not self.selector_vars:
+            return
+        csv_var = self.selector_vars.get("csv_path")
+        csv_path_raw = csv_var.get().strip() if csv_var is not None else ""
+        if not csv_path_raw:
+            messagebox.showerror("FrameSelector", "Select a CSV file in the Path field.")
+            return
+        csv_path = Path(csv_path_raw).expanduser()
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                headers = reader.fieldnames or []
+                field_map = {name.lower(): name for name in headers if name}
+                selected_key = field_map.get("selected(1=keep)") or field_map.get("selected")
+                score_key = field_map.get("score")
+                filename_key = field_map.get("filename")
+                index_key = field_map.get("index")
+                if not selected_key or not score_key:
+                    raise ValueError("CSV must contain 'selected(1=keep)' (or 'selected') and 'score' columns.")
+                selected_entries: List[Tuple[float, str, str]] = []
+                for row in reader:
+                    if not row:
+                        continue
+                    flag = str(row.get(selected_key, "")).strip().lower()
+                    if flag not in {"1", "true", "yes", "keep"}:
+                        continue
+                    score_raw = row.get(score_key)
+                    try:
+                        score_val = float(score_raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(score_val):
+                        continue
+                    fname = row.get(filename_key, "") if filename_key else ""
+                    idx_text = row.get(index_key, "") if index_key else ""
+                    selected_entries.append((score_val, fname, idx_text))
+        except FileNotFoundError:
+            messagebox.showerror("FrameSelector", f"CSV file not found:\n{csv_path}")
+            return
+        except ValueError as exc:
+            messagebox.showerror("FrameSelector", str(exc))
+            return
+        except Exception as exc:  # pragma: no cover - unexpected CSV error
+            messagebox.showerror("FrameSelector", f"Failed to read CSV:\n{exc}")
+            return
+
+        if not selected_entries:
+            self._append_text_widget(
+                self.selector_log,
+                f"[score] {csv_path.name}: no selected entries with valid scores.",
+            )
+            return
+
+        sorted_entries = sorted(selected_entries, key=lambda item: item[0])
+        try:
+            limit_text = self.selector_count_var.get().strip()
+            max_lines = int(limit_text) if limit_text else 20
+        except (TypeError, ValueError):
+            max_lines = 20
+        max_lines = max(1, min(max_lines, 200))
+        suspects = sorted_entries[:max_lines]
+
+        self._append_text_widget(
+            self.selector_log,
+            (
+                f"[score] {csv_path.name}: selected={len(selected_entries)} "
+                f"showing lowest {len(suspects)} scores (limit={max_lines})"
+            ),
+        )
+        if not suspects:
+            self._append_text_widget(self.selector_log, "[score] No low-score selections detected.")
+            return
+
+        for score, fname, idx_text in suspects:
+            label = fname or (f"index {idx_text}" if idx_text else "(unknown)")
+            self._append_text_widget(
+                self.selector_log,
+                f"  - {label} (score={score:.4f})",
+            )
 
     def _select_directory(
         self,
@@ -2265,7 +2368,38 @@ class PreviewApp:
         updated.jobs = jobs_value
         self.jobs_var.set(jobs_value)
 
+        out_dir_text = self.output_path_var.get().strip()
+        if out_dir_text:
+            out_dir_path = Path(out_dir_text).expanduser()
+            self.out_dir = out_dir_path
+            normalized = str(out_dir_path)
+            updated.out_dir = normalized
+            self.output_path_var.set(normalized)
+        else:
+            self.out_dir = None
+            updated.out_dir = None
+            self.output_path_var.set("")
+
         return updated
+
+    def _apply_preset_defaults(self, preset_value: str) -> None:
+        preset_defaults: Dict[str, Dict[str, Any]] = {
+            "fisheyelike": {"count": 10, "focal_mm": 17.0},
+            "2views": {"size": 3600, "focal_mm": 6.0},
+            "fisheyeXY": {"count": 8},
+        }
+        values = preset_defaults.get(preset_value)
+        if not values:
+            return
+        # Reset HFOV to allow focal-based presets to take effect.
+        self.current_args.hfov = None
+        if hasattr(self.current_args, "hfov_explicit"):
+            setattr(self.current_args, "hfov_explicit", False)
+        for field_name, field_value in values.items():
+            setattr(self.current_args, field_name, field_value)
+            explicit_flag = f"{field_name}_explicit"
+            if hasattr(self.current_args, explicit_flag):
+                setattr(self.current_args, explicit_flag, False)
 
     def on_preset_changed(self, selection: str) -> None:
         preset_value = selection or self.field_vars["preset"].get()
@@ -2284,6 +2418,7 @@ class PreviewApp:
         self.current_args.ffthreads = current_ffthreads
         self.current_args.jobs = current_jobs
         self.current_args.show_seam_overlay = seam_prev
+        self._apply_preset_defaults(preset_value)
         if getattr(self.current_args, "input_is_video", False) or self.source_is_video:
             fps_value = video_prev_values.get("fps")
             if fps_value is None or fps_value <= 0:
@@ -2340,7 +2475,10 @@ class PreviewApp:
         initial = str(initial_path)
         selected = filedialog.askdirectory(parent=self.root, initialdir=initial)
         if selected:
-            self.output_path_var.set(selected)
+            path_obj = Path(selected).expanduser()
+            self.out_dir = path_obj
+            self.current_args.out_dir = str(path_obj)
+            self.output_path_var.set(str(path_obj))
 
     def prompt_for_directory(self, initial: bool = False) -> None:
         initial_path = self.in_dir
@@ -2478,7 +2616,23 @@ class PreviewApp:
     def load_image(self) -> None:
         if self.image_path is None:
             return
-        self.pano_image = Image.open(self.image_path)
+        try:
+            with Image.open(self.image_path) as img:
+                pano = img.copy()
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to open image:\n{self.image_path}\n{exc}")
+            return
+        if pano.mode not in {"RGB", "RGBA", "L"}:
+            try:
+                pano = pano.convert("RGB")
+            except Exception as exc:
+                messagebox.showerror("Error", f"Unsupported image mode '{pano.mode}' for {self.image_path.name}:\n{exc}")
+                return
+        elif pano.mode == "L":
+            # Ensure consistent 8-bit grayscale data
+            pano = pano.convert("L")
+
+        self.pano_image = pano
         self.pano_width, self.pano_height = self.pano_image.size
 
         try:
@@ -2742,6 +2896,12 @@ class PreviewApp:
     def on_execute(self) -> None:
         if self.is_executing:
             return
+        updated = self.collect_updated_args()
+        if updated is None:
+            return
+        self.current_args = updated
+        ensure_explicit_flags(self.current_args)
+        self.result = None
         if self.result is None or not self.result.jobs:
             self.refresh_overlays()
         if self.result is None or not self.result.jobs:
