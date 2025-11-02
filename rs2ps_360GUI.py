@@ -41,7 +41,7 @@ COLOR_CYCLE = [
     "#9b5de5",
 ]
 
-PRESET_CHOICES = ["default", "2views", "fisheyelike", "evenMinus30", "evenPlus30", "fisheyeXY"]
+PRESET_CHOICES = ["default", "fisheyelike", "2views", "evenMinus30", "evenPlus30", "fisheyeXY"]
 
 HUMAN_MODE_CHOICES = ["mask", "alpha", "cutout", "keep_person", "remove_person", "inpaint"]
 
@@ -545,6 +545,10 @@ class PreviewApp:
         self.selector_run_button: Optional[tk.Button] = None
         self.selector_show_score_button: Optional[tk.Button] = None
         self.selector_count_var: Optional[tk.StringVar] = None
+        self.selector_summary_label: Optional[tk.Label] = None
+        self.selector_score_canvas: Optional[tk.Canvas] = None
+        self.selector_last_scores: List[Tuple[int, bool, Optional[float]]] = []
+        self.selector_auto_fetch_pending = False
 
         self.human_vars: Dict[str, tk.Variable] = {}
         self.human_log: Optional[tk.Text] = None
@@ -969,15 +973,37 @@ class PreviewApp:
             command=self._run_frame_selector,
         )
         self.selector_run_button.pack(side=tk.RIGHT, padx=4, pady=4)
-        self.selector_count_var = tk.StringVar(value="20")
+        self.selector_count_var = tk.StringVar(value="5")
         count_entry = tk.Entry(actions, textvariable=self.selector_count_var, width=6)
         count_entry.pack(side=tk.LEFT, padx=(4, 0), pady=4)
+        tk.Label(actions, text="%").pack(side=tk.LEFT, padx=(0, 4), pady=4)
         self.selector_show_score_button = tk.Button(
             actions,
-            text="Fetch Sharpness Scores From CSV",
+            text="Check Selection Blur",
             command=self._show_selector_scores,
         )
         self.selector_show_score_button.pack(side=tk.LEFT, padx=(4, 4), pady=4)
+
+        summary_frame = tk.LabelFrame(container, text="Sharpness Overview")
+        summary_frame.pack(fill="x", padx=8, pady=(0, 8))
+        self.selector_summary_label = tk.Label(
+            summary_frame,
+            text="No CSV loaded.",
+            anchor="w",
+        )
+        self.selector_summary_label.pack(fill="x", padx=6, pady=(4, 2))
+        self.selector_score_canvas = tk.Canvas(
+            summary_frame,
+            height=36,
+            bg="#f4f4f4",
+            highlightthickness=0,
+        )
+        self.selector_score_canvas.pack(fill="x", expand=True, padx=6, pady=(0, 4))
+        tk.Label(
+            summary_frame,
+            text="Legend: selected = teal, suspect = red, others = gray",
+            anchor="w",
+        ).pack(fill="x", padx=6, pady=(0, 4))
 
         log_frame = tk.LabelFrame(container, text="Log")
         log_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -1527,6 +1553,16 @@ class PreviewApp:
                 process.terminate()
             except Exception:
                 pass
+        if key == "selector":
+            pending = self.selector_auto_fetch_pending
+            self.selector_auto_fetch_pending = False
+            mode_now = "none"
+            if self.selector_vars:
+                mode_var = self.selector_vars.get("csv_mode")
+                if mode_var is not None:
+                    mode_now = mode_var.get().strip()
+            if pending and not stopped and rc == 0 and mode_now in {"write", "apply", "reselect"}:
+                self.root.after(100, self._show_selector_scores)
 
     def _stop_cli_process(self, key: str) -> None:
         with self._process_lock:
@@ -1698,6 +1734,8 @@ class PreviewApp:
         if not self.selector_vars:
             return
 
+        self.selector_auto_fetch_pending = False
+
         in_dir = self.selector_vars["in_dir"].get().strip()
         if not in_dir:
             messagebox.showerror("rs2ps_FrameSelector", "Input folder is required.")
@@ -1755,6 +1793,7 @@ class PreviewApp:
             elif csv_mode == "reselect":
                 cmd.extend(["-r", csv_path])
                 dry_run_required = True
+        self.selector_auto_fetch_pending = csv_mode in {"write", "apply", "reselect"}
 
         if dry_run_required:
             cmd.append("--dry_run")
@@ -1993,70 +2032,157 @@ class PreviewApp:
                 index_key = field_map.get("index")
                 if not selected_key or not score_key:
                     raise ValueError("CSV must contain 'selected(1=keep)' (or 'selected') and 'score' columns.")
-                selected_entries: List[Tuple[float, str, str]] = []
+                all_entries: List[Tuple[int, bool, Optional[float]]] = []
+                selected_entries: List[Tuple[float, str, str, int]] = []
+                row_counter = 0
                 for row in reader:
                     if not row:
                         continue
                     flag = str(row.get(selected_key, "")).strip().lower()
                     if flag not in {"1", "true", "yes", "keep"}:
-                        continue
+                        selected_flag = False
+                    else:
+                        selected_flag = True
                     score_raw = row.get(score_key)
                     try:
                         score_val = float(score_raw)
                     except (TypeError, ValueError):
-                        continue
-                    if not math.isfinite(score_val):
-                        continue
-                    fname = row.get(filename_key, "") if filename_key else ""
-                    idx_text = row.get(index_key, "") if index_key else ""
-                    selected_entries.append((score_val, fname, idx_text))
+                        score_val = None
+                    if score_val is not None and not math.isfinite(score_val):
+                        score_val = None
+                    if index_key:
+                        idx_raw = row.get(index_key, "")
+                    else:
+                        idx_raw = ""
+                    try:
+                        frame_idx = int(idx_raw)
+                    except (TypeError, ValueError):
+                        frame_idx = row_counter
+                    row_counter += 1
+                    all_entries.append((frame_idx, selected_flag, score_val))
+                    if selected_flag and score_val is not None:
+                        fname = row.get(filename_key, "") if filename_key else ""
+                        idx_text = row.get(index_key, "") if index_key else ""
+                        selected_entries.append((score_val, fname, idx_text, frame_idx))
         except FileNotFoundError:
             messagebox.showerror("FrameSelector", f"CSV file not found:\n{csv_path}")
+            self._update_selector_score_view([], set())
             return
         except ValueError as exc:
             messagebox.showerror("FrameSelector", str(exc))
+            self._update_selector_score_view([], set())
             return
         except Exception as exc:  # pragma: no cover - unexpected CSV error
             messagebox.showerror("FrameSelector", f"Failed to read CSV:\n{exc}")
+            self._update_selector_score_view([], set())
             return
 
-        if not selected_entries:
-            self._append_text_widget(
-                self.selector_log,
-                f"[score] {csv_path.name}: no selected entries with valid scores.",
-            )
-            return
+        # Sort selected entries by ascending score
+        selected_entries.sort(key=lambda item: item[0])
 
-        sorted_entries = sorted(selected_entries, key=lambda item: item[0])
+        selected_flag_total = sum(1 for _, s, _ in all_entries if s)
         try:
             if self.selector_count_var is not None:
                 limit_source = self.selector_count_var.get()
             else:
                 limit_source = ""
             limit_text = str(limit_source).strip()
-            max_lines = int(limit_text) if limit_text else 20
+            percent_text = limit_text.rstrip("%")
+            limit_percent = float(percent_text) if percent_text else 5.0
         except (TypeError, ValueError):
-            max_lines = 20
-        max_lines = max(1, min(max_lines, 200))
-        suspects = sorted_entries[:max_lines]
+            limit_percent = 5.0
+        limit_percent = max(0.1, min(limit_percent, 100.0))
+        if selected_entries:
+            max_lines = max(1, min(200, math.ceil((limit_percent / 100.0) * len(selected_entries))))
+            suspects = selected_entries[:max_lines]
+        else:
+            max_lines = 0
+            suspects = []
+        suspect_indices = {entry[3] for entry in suspects}
+        all_entries.sort(key=lambda item: item[0])
+        self.selector_last_scores = all_entries
+        self._update_selector_score_view(all_entries, suspect_indices)
 
         self._append_text_widget(
             self.selector_log,
             (
-                f"[score] {csv_path.name}: selected={len(selected_entries)} "
-                f"showing lowest {len(suspects)} scores (limit={max_lines})"
+                f"[score] {csv_path.name}: selected={selected_flag_total} "
+                f"showing lowest {len(suspects)} scores ({limit_percent:.1f}% of selected, limit={max_lines})"
             ),
         )
         if not suspects:
             self._append_text_widget(self.selector_log, "[score] No low-score selections detected.")
             return
 
-        for score, fname, idx_text in suspects:
+        for score, fname, idx_text, _frame_idx in suspects:
             label = fname or (f"index {idx_text}" if idx_text else "(unknown)")
             self._append_text_widget(
                 self.selector_log,
                 f"  - {label} (score={score:.4f})",
             )
+
+    def _update_selector_score_view(
+        self,
+        rows: List[Tuple[int, bool, Optional[float]]],
+        suspect_indices: Set[int],
+    ) -> None:
+        if self.selector_summary_label is not None:
+            if not rows:
+                self.selector_summary_label.configure(text="No CSV loaded.")
+            else:
+                total = len(rows)
+                selected_count = sum(1 for _, selected, _ in rows if selected)
+                suspect_count = len(suspect_indices)
+                selected_scores = [
+                    score for _, selected, score in rows if selected and score is not None
+                ]
+                if selected_scores:
+                    average_score = sum(selected_scores) / len(selected_scores)
+                    summary = (
+                        f"Frames: {total} | Selected: {selected_count} "
+                        f"| Suspects: {suspect_count} | Avg score: {average_score:.4f}"
+                    )
+                else:
+                    summary = (
+                        f"Frames: {total} | Selected: {selected_count} | Suspects: {suspect_count}"
+                    )
+                self.selector_summary_label.configure(text=summary)
+
+        canvas = self.selector_score_canvas
+        if canvas is None:
+            return
+        canvas.delete("all")
+        if not rows:
+            canvas.create_text(
+                int(canvas.winfo_width() or 200) / 2,
+                int(canvas.cget("height") or 36) / 2,
+                text="No data",
+                fill="#666666",
+            )
+            return
+
+        canvas.update_idletasks()
+        width = canvas.winfo_width()
+        if width <= 1:
+            width = int(canvas.cget("width") or 600)
+            if width <= 1:
+                width = 600
+            canvas.configure(width=width)
+        height = int(canvas.cget("height") or 36)
+
+        total = len(rows)
+        bar_width = max(1.0, width / float(total))
+        suspect_set = set(suspect_indices)
+        for idx, (frame_idx, selected_flag, _score_val) in enumerate(rows):
+            x0 = idx * bar_width
+            x1 = x0 + bar_width
+            color = "#d0d0d0"
+            if selected_flag:
+                color = "#4ecdc4"
+            if frame_idx in suspect_set:
+                color = "#ff6b6b"
+            canvas.create_rectangle(x0, 0, x1, height, fill=color, outline="")
+        canvas.create_rectangle(0, 0, bar_width * total, height, outline="#808080")
 
     def _select_directory(
         self,
@@ -2918,7 +3044,7 @@ class PreviewApp:
                             centre[1] * self.scale,
                             text=view_id,
                             fill=color,
-                            font=("TkDefaultFont", 10, "bold"),
+                            font=("TkDefaultFont", 20, "bold"),
                             tags=("overlay",),
                         )
                 if seam_line_specs:
