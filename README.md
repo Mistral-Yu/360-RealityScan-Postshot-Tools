@@ -11,7 +11,7 @@ A consolidated toolkit for turning 360° video captures into RealityScan-friendl
 ### Requirements
 - Python **3.7** or newer
 - `pip` for installing Python packages
-- [FFmpeg](https://ffmpeg.org/) and `ffprobe` available on your `PATH`
+- [FFmpeg](https://ffmpeg.org/)  available on your `PATH`
 - [PyTorch](https://pytorch.org/get-started/locally/) (`torch` **1.10+** and matching `torchvision` build) for the human masking tool
 - A GPU is not required, but fast storage/CPU cores benefit multi-threaded exports. CUDA acceleration is optional for masking but speeds up large batches.
 
@@ -35,7 +35,6 @@ A consolidated toolkit for turning 360° video captures into RealityScan-friendl
 4. **Verify FFmpeg**
    ```bash
    ffmpeg -version
-   ffprobe -version
    ```
 
 ---
