@@ -8,6 +8,7 @@ import copy
 import itertools
 import math
 import pathlib
+from collections import defaultdict
 from pathlib import Path
 import re
 import shlex
@@ -45,6 +46,7 @@ PRESET_CHOICES = ["default", "fisheyelike", "2views", "evenMinus30", "evenPlus30
 
 HUMAN_MODE_CHOICES = ["mask", "alpha", "cutout", "keep_person", "remove_person", "inpaint"]
 
+DEFAULT_SELECTOR_CSV_NAME = "selected_image_list.csv"
 
 
 class ToolTip:
@@ -523,6 +525,8 @@ class PreviewApp:
         self.left_frame: Optional[tk.Frame] = None
         self.canvas: Optional[tk.Canvas] = None
         self.canvas_image_id: Optional[int] = None
+        self.canvas_offset_x = 0.0
+        self.canvas_offset_y = 0.0
         self.folder_path_var = tk.StringVar()
         self.output_path_var = tk.StringVar()
         self._tooltips: List[ToolTip] = []
@@ -539,6 +543,9 @@ class PreviewApp:
         self.video_vars: Dict[str, tk.Variable] = {}
         self.video_log: Optional[tk.Text] = None
         self.video_run_button: Optional[tk.Button] = None
+        self.video_inspect_button: Optional[tk.Button] = None
+
+        self.preview_inspect_button: Optional[tk.Button] = None
 
         self.selector_vars: Dict[str, tk.Variable] = {}
         self.selector_log: Optional[tk.Text] = None
@@ -549,6 +556,9 @@ class PreviewApp:
         self.selector_score_canvas: Optional[tk.Canvas] = None
         self.selector_last_scores: List[Tuple[int, bool, Optional[float]]] = []
         self.selector_auto_fetch_pending = False
+        self.selector_csv_auto = True
+        self.selector_csv_auto_value = ""
+        self._selector_csv_updating = False
 
         self.human_vars: Dict[str, tk.Variable] = {}
         self.human_log: Optional[tk.Text] = None
@@ -715,6 +725,13 @@ class PreviewApp:
 
         actions = tk.Frame(container)
         actions.pack(fill="x", padx=8, pady=(0, 8))
+        self.video_inspect_button = tk.Button(
+            actions,
+            text="Inspect video",
+            command=self._inspect_video_metadata,
+            state="disabled",
+        )
+        self.video_inspect_button.pack(side=tk.LEFT, padx=4, pady=4)
         self.video_stop_button = tk.Button(
             actions,
             text="Stop",
@@ -778,6 +795,7 @@ class PreviewApp:
         if "video" not in self.video_vars or "output" not in self.video_vars:
             return
         video_value = self.video_vars["video"].get().strip()
+        self._update_video_inspect_state()
         prefix_var = self.video_vars.get("prefix")
         if not video_value:
             if prefix_var is not None and (self._video_prefix_auto or not prefix_var.get().strip()):
@@ -838,6 +856,384 @@ class PreviewApp:
         finally:
             self._video_output_updating = False
 
+    def _update_video_inspect_state(self) -> None:
+        button = self.video_inspect_button
+        if button is None:
+            return
+        video_var = self.video_vars.get("video")
+        if video_var is None:
+            button.configure(state="disabled")
+            return
+        path_text = video_var.get().strip()
+        if not path_text:
+            button.configure(state="disabled")
+            return
+        try:
+            path = Path(path_text).expanduser()
+        except Exception:
+            button.configure(state="disabled")
+            return
+        button.configure(state="normal" if path.exists() else "disabled")
+
+    def _update_preview_inspect_state(self) -> None:
+        button = self.preview_inspect_button
+        if button is None:
+            return
+        if not self.source_is_video:
+            button.configure(state="disabled")
+            return
+        video_path = None
+        if self.files:
+            candidate = self.files[0]
+            if isinstance(candidate, Path):
+                video_path = candidate
+            else:
+                try:
+                    video_path = Path(candidate)
+                except Exception:
+                    video_path = None
+        if video_path is None:
+            button.configure(state="disabled")
+            return
+        try:
+            exists = video_path.exists()
+        except Exception:
+            exists = False
+        button.configure(state="normal" if exists else "disabled")
+
+    def _resolve_ffmpeg_path(self) -> str:
+        ffmpeg_value = self.ffmpeg_path_var.get().strip()
+        if not ffmpeg_value:
+            ffmpeg_value = str(getattr(self.defaults, "ffmpeg", "ffmpeg"))
+        if not ffmpeg_value:
+            return "ffmpeg"
+        try:
+            ffmpeg_path = Path(ffmpeg_value).expanduser()
+        except Exception:
+            return ffmpeg_value
+        if ffmpeg_path.is_file():
+            return str(ffmpeg_path)
+        return ffmpeg_value
+
+    @staticmethod
+    def _parse_duration_text(duration_text: str) -> Optional[float]:
+        if not duration_text:
+            return None
+        match = re.match(r"(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2}(?:\.\d+)?)", duration_text.strip())
+        if not match:
+            return None
+        try:
+            hours = int(match.group("h"))
+            minutes = int(match.group("m"))
+            seconds = float(match.group("s"))
+            return hours * 3600.0 + minutes * 60.0 + seconds
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_fps_from_stream(stream_text: str) -> Optional[float]:
+        if not stream_text:
+            return None
+        fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps", stream_text)
+        if not fps_match:
+            return None
+        try:
+            return float(fps_match.group(1))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _format_metadata_entries(entries: Sequence[str]) -> List[str]:
+        formatted: List[str] = []
+        for raw in entries:
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if not text:
+                continue
+            if ":" in text:
+                key, value = text.split(":", 1)
+                formatted.append(f"{key.strip()}: {value.strip()}")
+            else:
+                formatted.append(text)
+        return formatted
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0.0, seconds)
+        total_ms = int(round(seconds * 1000))
+        ms = total_ms % 1000
+        total_seconds = total_ms // 1000
+        s = total_seconds % 60
+        total_minutes = total_seconds // 60
+        m = total_minutes % 60
+        h = total_minutes // 60
+        return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+    def _inspect_video_metadata(self) -> None:
+        if not self.video_vars:
+            return
+        video_value = self.video_vars.get("video")
+        if video_value is None:
+            return
+        video_path_text = video_value.get().strip()
+        if not video_path_text:
+            messagebox.showerror("Video metadata", "Select an input video first.")
+            return
+        try:
+            video_path = Path(video_path_text).expanduser().resolve(strict=True)
+        except FileNotFoundError:
+            messagebox.showerror("Video metadata", f"Video file not found:\n{video_path_text}")
+            return
+        except Exception as exc:
+            messagebox.showerror("Video metadata", f"Failed to resolve video path:\n{exc}")
+            return
+
+        lines = self._collect_video_metadata_lines(video_path, "Video metadata")
+        if not lines:
+            return
+        for line in lines:
+            self._append_text_widget(self.video_log, line)
+
+    def _inspect_preview_video_metadata(self) -> None:
+        if not self.source_is_video:
+            messagebox.showerror("Preview video metadata", "Load a video in rs2ps_360PerspCut first.")
+            return
+        if not self.files:
+            messagebox.showerror("Preview video metadata", "No video source is available in rs2ps_360PerspCut.")
+            return
+        candidate = self.files[0]
+        raw_text = str(candidate)
+        try:
+            video_path = candidate if isinstance(candidate, Path) else Path(candidate)
+            video_path = video_path.expanduser().resolve(strict=True)
+        except FileNotFoundError:
+            messagebox.showerror("Preview video metadata", f"Video file not found:\n{raw_text}")
+            return
+        except Exception as exc:
+            messagebox.showerror("Preview video metadata", f"Failed to resolve video path:\n{exc}")
+            return
+
+        lines = self._collect_video_metadata_lines(video_path, "Preview video metadata")
+        if not lines:
+            return
+        for line in lines:
+            self._append_text_widget(self.log_text, line)
+
+    def _collect_video_metadata_lines(
+        self,
+        video_path: Path,
+        dialog_title: str,
+    ) -> Optional[List[str]]:
+        ffmpeg_path = self._resolve_ffmpeg_path()
+        cmd = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-i",
+            str(video_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            messagebox.showerror(
+                dialog_title,
+                f"ffmpeg not found: {ffmpeg_path}\nAdjust the ffmpeg path in the Controls panel.",
+            )
+            return None
+        except Exception as exc:
+            messagebox.showerror(dialog_title, f"ffmpeg execution failed:\n{exc}")
+            return None
+
+        combined_output = (result.stderr or "") + "\n" + (result.stdout or "")
+        if not combined_output.strip():
+            messagebox.showinfo(dialog_title, "ffmpeg did not produce any output to inspect.")
+            return None
+
+        raw_lines = combined_output.splitlines()
+
+        def collect_indented_block(start_index: int) -> List[str]:
+            block: List[str] = []
+            for j in range(start_index + 1, len(raw_lines)):
+                candidate = raw_lines[j]
+                if not candidate.strip():
+                    break
+                if candidate.lstrip() == candidate:
+                    break
+                block.append(candidate.strip())
+            return block
+
+        def previous_non_empty(index: int) -> str:
+            for j in range(index - 1, -1, -1):
+                candidate = raw_lines[j].strip()
+                if candidate:
+                    return candidate
+            return ""
+
+        stream_metadata_raw: Dict[str, List[str]] = defaultdict(list)
+        stream_side_raw: Dict[str, List[str]] = defaultdict(list)
+
+        for idx, raw_line in enumerate(raw_lines):
+            stripped = raw_line.strip()
+            if stripped.startswith("Metadata:"):
+                prev = previous_non_empty(idx)
+                block = collect_indented_block(idx)
+                if prev.startswith("Stream #"):
+                    stream_metadata_raw[prev].extend(block)
+            elif stripped.startswith("Side data:"):
+                prev = previous_non_empty(idx)
+                block = collect_indented_block(idx)
+                if prev.startswith("Stream #"):
+                    stream_side_raw[prev].extend(block)
+
+        stream_pattern = re.compile(
+            r"Stream #(?P<id>\d+:\d+)(?:\[[^\]]+\])?(?:\((?P<lang>[^\)]*)\))?: "
+            r"(?P<type>Video|Audio): (?P<details>.+)"
+        )
+        stream_infos: List[Dict[str, Any]] = []
+        for raw_line in raw_lines:
+            stripped = raw_line.strip()
+            match = stream_pattern.match(stripped)
+            if not match:
+                continue
+            key = stripped
+            stream_infos.append(
+                {
+                    "id": match.group("id"),
+                    "lang": (match.group("lang") or "").strip(),
+                    "type": match.group("type"),
+                    "details": match.group("details").strip(),
+                    "metadata": self._format_metadata_entries(stream_metadata_raw.get(key, [])),
+                    "side": self._format_metadata_entries(stream_side_raw.get(key, [])),
+                }
+            )
+
+        def parse_video_stream(info: Dict[str, Any]) -> Dict[str, Any]:
+            tokens = [token.strip() for token in info["details"].split(",") if token.strip()]
+            codec = tokens[0] if tokens else info["details"]
+            pixel_format = ""
+            pixel_details: List[str] = []
+            color_tags: List[str] = []
+            resolution = ""
+            sar_dar = ""
+            bitrate = ""
+            frame_rate_value = self._parse_fps_from_stream(info["details"])
+            frame_rate_text_local = ""
+            other_tags: List[str] = []
+
+            if len(tokens) > 1:
+                fmt_token = tokens[1]
+                if "(" in fmt_token:
+                    fmt_name, _, rest = fmt_token.partition("(")
+                    pixel_format = fmt_name.strip()
+                    rest = rest.rstrip(")")
+                    if rest:
+                        pixel_details = [part.strip() for part in rest.split(",") if part.strip()]
+                else:
+                    pixel_format = fmt_token
+                color_tags.extend(pixel_details)
+
+            for token in tokens[2:]:
+                token = token.strip()
+                if not token:
+                    continue
+                lower = token.lower()
+                if re.match(r"\d{2,5}x\d{2,5}", token):
+                    resolution = token
+                elif token.startswith("[") and token.endswith("]"):
+                    sar_dar = token
+                elif "kb/s" in lower:
+                    bitrate = token
+                elif lower.endswith("fps"):
+                    if not frame_rate_value and not frame_rate_text_local:
+                        frame_rate_text_local = token
+                elif any(keyword in lower for keyword in ("bt", "progressive", "interlaced", "tv", "pc")):
+                    color_tags.append(token)
+                elif lower.endswith("tbr") or lower.endswith("tbn") or lower.endswith("tbc"):
+                    other_tags.append(token)
+                else:
+                    other_tags.append(token)
+
+            color_tags = list(dict.fromkeys(color_tags))
+            other_tags = list(dict.fromkeys(other_tags))
+
+            return {
+                "id": info["id"],
+                "lang": info["lang"],
+                "codec": codec,
+                "pixel_format": pixel_format,
+                "pixel_details": pixel_details,
+                "resolution": resolution,
+                "sar_dar": sar_dar,
+                "bitrate": bitrate,
+                "frame_rate": frame_rate_value,
+                "frame_rate_text": frame_rate_text_local,
+                "color_tags": color_tags,
+                "other": other_tags,
+                "metadata": info["metadata"],
+                "side": info["side"],
+            }
+
+        video_streams = [parse_video_stream(info) for info in stream_infos if info["type"] == "Video"]
+
+        lines: List[str] = [f"[inspect] {video_path.name}"]
+
+        duration_match = re.search(r"Duration:\s*(\d{2}:\d{2}:\d{2}\.\d+)", combined_output)
+        duration_seconds: Optional[float] = None
+        if duration_match:
+            duration_seconds = self._parse_duration_text(duration_match.group(1))
+
+        if video_streams:
+            video = video_streams[0]
+            lines.append("Video stream:")
+            stream_label = f"#{video['id']}"
+            if video["lang"]:
+                stream_label += f" ({video['lang']})"
+            lines.append(f"  Stream: {stream_label}")
+            lines.append(f"  Codec: {video['codec']}")
+            if video["pixel_format"]:
+                pixel_line = f"  Pixel format: {video['pixel_format']}"
+                if video["pixel_details"]:
+                    pixel_line += f" ({', '.join(video['pixel_details'])})"
+                lines.append(pixel_line)
+            if video["resolution"]:
+                resolution_line = video["resolution"]
+                if video["sar_dar"]:
+                    resolution_line += f" {video['sar_dar']}"
+                lines.append(f"  Resolution: {resolution_line}")
+            if video["bitrate"]:
+                lines.append(f"  Bit rate: {video['bitrate']}")
+            if video["frame_rate"]:
+                lines.append(f"  Frame rate: {video['frame_rate']:.3f} fps")
+            elif video["frame_rate_text"]:
+                lines.append(f"  Frame rate: {video['frame_rate_text']}")
+            if video["frame_rate"] and duration_seconds is not None:
+                estimated_frames = int(round(duration_seconds * video["frame_rate"]))
+                lines.append(f"  Estimated frames: {estimated_frames}")
+            if video["color_tags"]:
+                clean_color = [tag.rstrip(")") for tag in video["color_tags"]]
+                lines.append(f"  Color: {', '.join(clean_color)}")
+            if video["other"]:
+                lines.append(f"  Other: {', '.join(video['other'])}")
+            if video["metadata"]:
+                lines.append("  Metadata:")
+                for item in video["metadata"]:
+                    lines.append(f"    {item}")
+            if video["side"]:
+                lines.append("  Side data:")
+                for item in video["side"]:
+                    lines.append(f"    {item}")
+
+        if result.returncode != 0 and "At least one output file must be specified" not in combined_output:
+            lines.append(f"[warn] ffmpeg exited with code {result.returncode}")
+
+        return lines
+
+
     def _build_frame_selector_tab(self, parent: tk.Widget) -> None:
         container = tk.Frame(parent)
         container.pack(fill="both", expand=True)
@@ -847,23 +1243,25 @@ class PreviewApp:
 
         self.selector_vars = {
             "in_dir": tk.StringVar(),
-            "segment_size": tk.StringVar(),
+            "segment_size": tk.StringVar(value="10"),
             "dry_run": tk.BooleanVar(value=True),
-            "workers": tk.StringVar(),
+            "workers": tk.StringVar(value="auto"),
             "ext": tk.StringVar(value="all"),
             "sort": tk.StringVar(value="lastnum"),
             "metric": tk.StringVar(value="hybrid"),
-            "csv_mode": tk.StringVar(value="none"),
+            "csv_mode": tk.StringVar(value="write"),
             "csv_path": tk.StringVar(),
             "crop_ratio": tk.StringVar(value="0.8"),
             "min_spacing_frames": tk.StringVar(),
             "prune_motion": tk.BooleanVar(value=False),
-            "augment_gap": tk.BooleanVar(value=False),
+            "augment_gap": tk.BooleanVar(value=True),
             "augment_lowlight": tk.BooleanVar(value=False),
             "augment_motion": tk.BooleanVar(value=False),
         }
 
         self.selector_vars["csv_mode"].trace_add("write", self._on_selector_csv_mode_changed)
+        self.selector_vars["in_dir"].trace_add("write", self._on_selector_in_dir_changed)
+        self.selector_vars["csv_path"].trace_add("write", self._on_selector_csv_path_changed)
 
         row = 0
         tk.Label(params, text="Input folder").grid(row=row, column=0, sticky="e", padx=4, pady=4)
@@ -871,7 +1269,11 @@ class PreviewApp:
         tk.Button(
             params,
             text="Browse...",
-            command=lambda: self._select_directory(self.selector_vars["in_dir"], title="Select input folder"),
+            command=lambda: self._select_directory(
+                self.selector_vars["in_dir"],
+                title="Select input folder",
+                on_select=self._on_selector_input_selected,
+            ),
         ).grid(row=row, column=2, padx=4, pady=4)
 
         row += 1
@@ -1371,6 +1773,8 @@ class PreviewApp:
         ffmpeg_frame = tk.LabelFrame(self.right_inner, text="ffmpeg Options")
         ffmpeg_frame.pack(fill="x", pady=(4, 4))
         ffmpeg_frame.columnconfigure(1, weight=1)
+        ffmpeg_frame.columnconfigure(3, weight=1)
+        ffmpeg_frame.columnconfigure(4, weight=0)
 
         ffmpeg_label = tk.Label(ffmpeg_frame, text="ffmpeg path")
         ffmpeg_label.grid(row=0, column=0, padx=4, pady=2, sticky="e")
@@ -1389,14 +1793,23 @@ class PreviewApp:
         jobs_label.grid(row=1, column=0, padx=4, pady=2, sticky="e")
         self._bind_help(jobs_label, "jobs")
         jobs_entry = tk.Entry(ffmpeg_frame, textvariable=self.jobs_var, width=10)
-        jobs_entry.grid(row=1, column=1, padx=4, pady=2, sticky="w")
+        jobs_entry.grid(row=1, column=1, padx=4, pady=2, sticky="we")
         self._bind_help(jobs_entry, "jobs")
         ffthreads_label = tk.Label(ffmpeg_frame, text="ffthreads")
         ffthreads_label.grid(row=1, column=2, padx=4, pady=2, sticky="e")
         self._bind_help(ffthreads_label, "ffthreads")
         ffthreads_entry = tk.Entry(ffmpeg_frame, textvariable=self.ffthreads_var, width=10)
-        ffthreads_entry.grid(row=1, column=3, padx=4, pady=2, sticky="w")
+        ffthreads_entry.grid(row=1, column=3, padx=4, pady=2, sticky="we")
         self._bind_help(ffthreads_entry, "ffthreads")
+
+        self.preview_inspect_button = tk.Button(
+            ffmpeg_frame,
+            text="Inspect video",
+            command=self._inspect_preview_video_metadata,
+            state="disabled",
+            width=16,
+        )
+        self.preview_inspect_button.grid(row=1, column=4, padx=(8, 4), pady=2, sticky="e")
 
         buttons_frame = tk.LabelFrame(self.right_inner, text="Actions")
         buttons_frame.pack(fill="x", pady=(8, 12), ipady=6)
@@ -1443,6 +1856,7 @@ class PreviewApp:
         self.help_text.bind("<Key>", self._block_text_edit)
         self.help_text.bind("<Button-1>", lambda event: self.help_text.focus_set())
         self._update_jpeg_quality_state()
+        self._update_preview_inspect_state()
         self._sync_panel_heights()
 
     def _set_text_widget(self, widget: Optional[tk.Text], text: str) -> None:
@@ -1759,14 +2173,14 @@ class PreviewApp:
 
         dry_run_required = bool(self.selector_vars["dry_run"].get())
 
-        workers = self.selector_vars["workers"].get().strip()
-        if workers:
+        workers_text = self.selector_vars["workers"].get().strip()
+        if workers_text and workers_text.lower() != "auto":
             try:
-                int(workers)
+                int(workers_text)
             except ValueError:
-                messagebox.showerror("rs2ps_FrameSelector", "Workers must be an integer.")
+                messagebox.showerror("rs2ps_FrameSelector", "Workers must be an integer or 'auto'.")
                 return
-            cmd.extend(["-w", workers])
+            cmd.extend(["-w", workers_text])
 
         ext_choice = self.selector_vars["ext"].get().strip()
         if ext_choice:
@@ -1958,7 +2372,7 @@ class PreviewApp:
         if self.selector_csv_entry is not None:
             if mode_value == "none":
                 self.selector_csv_entry.configure(state="disabled")
-                self.selector_vars["csv_path"].set("")
+                self._set_selector_csv_path_auto("")
             else:
                 self.selector_csv_entry.configure(state="normal")
         if self.selector_csv_button is not None:
@@ -1975,6 +2389,20 @@ class PreviewApp:
                 self.selector_dry_run_check.configure(state="disabled")
             else:
                 self.selector_dry_run_check.configure(state="normal")
+        csv_var = self.selector_vars.get("csv_path")
+        in_dir_var = self.selector_vars.get("in_dir")
+        if mode_value == "none":
+            self.selector_csv_auto = True
+            self.selector_csv_auto_value = ""
+        elif (
+            self.selector_csv_auto
+            and csv_var is not None
+            and not csv_var.get().strip()
+            and in_dir_var is not None
+        ):
+            in_dir_value = in_dir_var.get().strip()
+            if in_dir_value:
+                self._update_selector_csv_default(in_dir_value)
 
     def _browse_selector_csv(self) -> None:
         if not self.selector_vars:
@@ -2010,7 +2438,86 @@ class PreviewApp:
                 initialdir=str(initial_dir),
             )
         if path:
-            self.selector_vars["csv_path"].set(path)
+            self._set_selector_csv_path_manual(path)
+
+    def _set_selector_csv_path_auto(self, value: str) -> None:
+        if not self.selector_vars:
+            return
+        csv_var = self.selector_vars.get("csv_path")
+        if csv_var is None:
+            return
+        value_str = str(value) if value is not None else ""
+        self.selector_csv_auto_value = value_str
+        self._selector_csv_updating = True
+        try:
+            csv_var.set(value_str)
+        finally:
+            self._selector_csv_updating = False
+        self.selector_csv_auto = True
+
+    def _set_selector_csv_path_manual(self, value: str) -> None:
+        if not self.selector_vars:
+            return
+        csv_var = self.selector_vars.get("csv_path")
+        if csv_var is None:
+            return
+        value_str = str(value) if value is not None else ""
+        self.selector_csv_auto_value = value_str
+        self._selector_csv_updating = True
+        try:
+            csv_var.set(value_str)
+        finally:
+            self._selector_csv_updating = False
+        self.selector_csv_auto = False
+
+    def _update_selector_csv_default(self, input_dir: str) -> None:
+        if not self.selector_vars:
+            return
+        mode_var = self.selector_vars.get("csv_mode")
+        if mode_var is not None and mode_var.get().strip() == "none":
+            return
+        path_text = str(input_dir).strip() if input_dir is not None else ""
+        if not path_text:
+            self._set_selector_csv_path_auto("")
+            return
+        try:
+            folder = Path(path_text).expanduser()
+        except Exception:
+            return
+        default_path = folder / DEFAULT_SELECTOR_CSV_NAME
+        self._set_selector_csv_path_auto(str(default_path))
+
+    def _on_selector_in_dir_changed(self, *_args) -> None:
+        if not self.selector_vars or not self.selector_csv_auto:
+            return
+        if self._selector_csv_updating:
+            return
+        in_var = self.selector_vars.get("in_dir")
+        if in_var is None:
+            return
+        value = in_var.get().strip()
+        if not value:
+            self._set_selector_csv_path_auto("")
+            return
+        self._update_selector_csv_default(value)
+
+    def _on_selector_csv_path_changed(self, *_args) -> None:
+        if self._selector_csv_updating:
+            return
+        if not self.selector_vars:
+            return
+        csv_var = self.selector_vars.get("csv_path")
+        if csv_var is None:
+            return
+        current = csv_var.get().strip()
+        if current == self.selector_csv_auto_value.strip():
+            return
+        self.selector_csv_auto = False
+        self.selector_csv_auto_value = current
+
+    def _on_selector_input_selected(self, selected_path: str) -> None:
+        self.selector_csv_auto = True
+        self._update_selector_csv_default(selected_path)
 
     def _show_selector_scores(self) -> None:
         if not self.selector_vars:
@@ -2263,6 +2770,7 @@ class PreviewApp:
             setattr(self.current_args, "fps", None)
             setattr(self.current_args, "keep_rec709", False)
             self._video_preview_signature = None
+        self._update_preview_inspect_state()
 
     def _on_show_seam_toggle(self, var: tk.BooleanVar) -> None:
         value = bool(var.get())
@@ -2428,6 +2936,7 @@ class PreviewApp:
         else:
             self.output_path_var.set("")
         self._update_jpeg_quality_state()
+        self._update_preview_inspect_state()
 
 
     def _bind_help(self, widget: tk.Widget, key: str) -> None:
@@ -2759,6 +3268,7 @@ class PreviewApp:
             self.image_path = None
             self.pano_image = None
             self.display_image = None
+            self._update_preview_inspect_state()
             return False
         self.source_is_video = True
         self.folder_path_var.set(str(video_path))
@@ -2870,6 +3380,8 @@ class PreviewApp:
             return
         self.canvas.delete("all")
         self.photo = ImageTk.PhotoImage(self.display_image, master=self.root)
+        self.canvas_offset_x = 0.0
+        self.canvas_offset_y = 0.0
         self.canvas.configure(width=self.display_width, height=self.display_height)
         self.canvas_image_id = self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo)
         self.canvas.image = self.photo
@@ -3004,8 +3516,11 @@ class PreviewApp:
         ]
 
         if self.canvas is not None:
+            self._reposition_canvas_items()
             self.canvas.delete("overlay")
             if self.display_image is not None:
+                offset_x = self.canvas_offset_x
+                offset_y = self.canvas_offset_y
                 draw_items: List[Tuple[List[List[Tuple[float, float]]], Tuple[float, float], str, str]] = []
                 for spec, color in zip(self.matched_specs, itertools.cycle(COLOR_CYCLE)):
                     segments, centre = sample_view_segments(
@@ -3031,7 +3546,7 @@ class PreviewApp:
                             continue
                         flat_coords: List[float] = []
                         for px, py in segment:
-                            flat_coords.extend([px * self.scale, py * self.scale])
+                            flat_coords.extend([px * self.scale + offset_x, py * self.scale + offset_y])
                         self.canvas.create_line(
                             flat_coords,
                             fill=color,
@@ -3040,8 +3555,8 @@ class PreviewApp:
                         )
                     if not self.hide_labels:
                         self.canvas.create_text(
-                            centre[0] * self.scale,
-                            centre[1] * self.scale,
+                            centre[0] * self.scale + offset_x,
+                            centre[1] * self.scale + offset_y,
                             text=view_id,
                             fill=color,
                             font=("TkDefaultFont", 20, "bold"),
@@ -3051,10 +3566,10 @@ class PreviewApp:
                     seam_xs, line_width = seam_line_specs
                     for x in seam_xs:
                         self.canvas.create_line(
-                            x,
-                            0,
-                            x,
-                            self.display_height,
+                            x + offset_x,
+                            offset_y,
+                            x + offset_x,
+                            offset_y + self.display_height,
                             fill="#000000",
                             width=line_width,
                             tags=("overlay", "seam_line"),
@@ -3229,7 +3744,9 @@ class PreviewApp:
         right_height = max(self.right_inner.winfo_height(), self.right_inner.winfo_reqheight())
         desired_inner_height = max(self.display_height, right_height)
         self.left_frame.configure(height=desired_inner_height, width=self.display_width)
-        self.canvas.configure(height=self.display_height, width=self.display_width)
+        if self.canvas is not None:
+            target_canvas_height = max(desired_inner_height, self.display_height)
+            self.canvas.configure(height=target_canvas_height, width=self.display_width)
         if self.preview_frame is not None:
             self.preview_frame.configure(width=self.display_width + 16)
         if self.left_frame is not None:
@@ -3249,7 +3766,31 @@ class PreviewApp:
             self._preview_frame_padding = max(0, frame_height - inner_height)
             preview_height = desired_inner_height + self._preview_frame_padding
             self.preview_frame.configure(height=preview_height)
+        self._reposition_canvas_items()
         self._ensure_window_min_dimensions()
+
+    def _reposition_canvas_items(self) -> None:
+        if self.canvas is None:
+            return
+        self.canvas.update_idletasks()
+        canvas_width = max(int(self.canvas.winfo_width() or 0), self.display_width)
+        canvas_height = max(int(self.canvas.winfo_height() or 0), self.display_height)
+        offset_x = max(0.0, (canvas_width - self.display_width) / 2.0)
+        offset_y = max(0.0, (canvas_height - self.display_height) / 2.0)
+        delta_x = offset_x - self.canvas_offset_x
+        delta_y = offset_y - self.canvas_offset_y
+        self.canvas_offset_x = offset_x
+        self.canvas_offset_y = offset_y
+        if self.canvas_image_id is not None:
+            self.canvas.coords(self.canvas_image_id, offset_x, offset_y)
+        if delta_x or delta_y:
+            self.canvas.move("overlay", delta_x, delta_y)
+        if self.canvas.find_withtag("placeholder"):
+            self.canvas.coords(
+                "placeholder",
+                offset_x + self.display_width / 2,
+                offset_y + self.display_height / 2,
+            )
 
     def set_log_text(self, text: str) -> None:
         if self.log_text is None:
