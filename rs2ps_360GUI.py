@@ -2301,7 +2301,7 @@ class PreviewApp:
 
         workers_text = self.selector_vars["workers"].get().strip()
         auto_workers = self._auto_frame_selector_workers()
-        max_workers = max(1, auto_workers * 2)
+        max_workers = max(1, auto_workers * 3)
         if workers_text:
             if workers_text.lower() != "auto":
                 try:
@@ -2371,7 +2371,9 @@ class PreviewApp:
             cmd.extend(["--min_spacing_frames", min_spacing])
 
         if bool(self.selector_vars["augment_gap"].get()):
-            cmd.append("--augment_gap")
+            cmd.append("--augment_gaps")
+        else:
+            cmd.append("--no_augment_gaps")
         if bool(self.selector_vars["augment_lowlight"].get()):
             cmd.append("--augment_lowlight")
         if bool(self.selector_vars["augment_motion"].get()):
@@ -3344,7 +3346,7 @@ class PreviewApp:
                 messagebox.showerror("Input Error", "Workers must be a positive integer.")
                 return None
             auto_jobs = self._auto_preview_jobs()
-            max_jobs = max(1, auto_jobs * 2)
+            max_jobs = max(1, auto_jobs * 3)
             if jobs_int > max_jobs:
                 messagebox.showerror(
                     "Input Error",
