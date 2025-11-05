@@ -18,7 +18,8 @@ A consolidated toolkit for turning 360° video captures into RealityScan-friendl
 ### Setup Steps
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/your-org/360-RealityScan-Postshot-Tools.git
+
+   git clone https://github.com/Mistral-Yu/360-RealityScan-Postshot-Tools.git
    cd 360-RealityScan-Postshot-Tools
    ```
 2. **Create and activate a Conda environment**
