@@ -252,6 +252,24 @@ def main() -> None:
         default='ffmpeg',
         help='Path to the ffmpeg executable (default: ffmpeg).',
     )
+    ap.add_argument(
+        '--map-stream',
+        dest='map_stream',
+        default=None,
+        help=(
+            'Optional ffmpeg -map argument (e.g. 0:v:0) to select a '
+            'specific stream.'
+        ),
+    )
+    ap.add_argument(
+        '--name-suffix',
+        dest='name_suffix',
+        default='',
+        help=(
+            'Optional suffix inserted before the file extension '
+            '(e.g. _X).'
+        ),
+    )
     args = ap.parse_args()
 
     ffmpeg_exec = args.ffmpeg or 'ffmpeg'
@@ -294,7 +312,10 @@ def main() -> None:
     frame_prefix = re.sub(r'\s+', '_', frame_prefix) if frame_prefix else 'out'
     if not frame_prefix:
         frame_prefix = 'out'
-    pattern = out_dir / f'{frame_prefix}_%07d.{ext}'
+    suffix_text = args.name_suffix.strip() if args.name_suffix else ''
+    if suffix_text:
+        suffix_text = re.sub(r'\s+', '_', suffix_text)
+    pattern = out_dir / f'{frame_prefix}_%07d{suffix_text}.{ext}'
 
     inferred_bits = detect_input_bit_depth(in_path)
     out_bit_depth = 8 if inferred_bits <= 8 else 16
@@ -318,6 +339,9 @@ def main() -> None:
 
     if args.end is not None:
         cmd += ['-to', str(args.end)]
+
+    if args.map_stream:
+        cmd += ['-map', args.map_stream]
 
     cmd += ['-vf', ','.join(vf_chain)]
 
