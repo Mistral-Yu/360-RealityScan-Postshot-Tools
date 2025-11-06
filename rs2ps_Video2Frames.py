@@ -22,7 +22,11 @@ import time
 
 from typing import Optional, Tuple
 
+from rs2ps_360PerspCut import fov_from_focal_mm, v_fov_from_hfov
+
 PROGRESS_INTERVAL = 5
+FISHEYE_SENSOR_WIDTH_MM = 36.0
+FISHEYE_INPUT_FOV_DEG = 190.0
 
 
 def update_progress(
@@ -270,6 +274,51 @@ def main() -> None:
             '(e.g. _X).'
         ),
     )
+    ap.add_argument(
+        '--fisheye-perspective',
+        action='store_true',
+        help=(
+            'Apply an experimental dual fisheye to perspective transform '
+            'using ffmpeg v360 (intended for two fisheye streams).'
+        ),
+    )
+    ap.add_argument(
+        '--fisheye-focal-mm',
+        type=float,
+        default=8.0,
+        help=(
+            'Focal length in millimetres for deriving perspective FOV '
+            'when --fisheye-perspective is set (default: 8).'
+        ),
+    )
+    ap.add_argument(
+        '--fisheye-size',
+        type=int,
+        default=3840,
+        help=(
+            'Output square size in pixels for --fisheye-perspective '
+            '(default: 3840).'
+        ),
+    )
+    ap.add_argument(
+        '--fisheye-projection',
+        type=lambda value: value.lower(),
+        choices=('equidistant', 'equisolid'),
+        default='equisolid',
+        help=(
+            'Input fisheye projection model for --fisheye-perspective '
+            '(equidistant or equisolid, default: equisolid).'
+        ),
+    )
+    ap.add_argument(
+        '--fisheye-input-fov',
+        type=float,
+        default=FISHEYE_INPUT_FOV_DEG,
+        help=(
+            'Input fisheye field-of-view in degrees for --fisheye-perspective '
+            f'(default: {FISHEYE_INPUT_FOV_DEG:.0f}).'
+        ),
+    )
     args = ap.parse_args()
 
     ffmpeg_exec = args.ffmpeg or 'ffmpeg'
@@ -279,6 +328,16 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    if args.fisheye_perspective:
+        if args.fisheye_focal_mm <= 0.0:
+            print('Focal length must be greater than zero when using --fisheye-perspective.', file=sys.stderr)
+            sys.exit(1)
+        if args.fisheye_size <= 0:
+            print('Output size must be greater than zero when using --fisheye-perspective.', file=sys.stderr)
+            sys.exit(1)
+        if args.fisheye_input_fov <= 0.0:
+            print('Input fisheye FOV must be greater than zero when using --fisheye-perspective.', file=sys.stderr)
+            sys.exit(1)
 
     in_path = pathlib.Path(args.video).expanduser().resolve()
     if not in_path.exists():
@@ -320,16 +379,41 @@ def main() -> None:
     inferred_bits = detect_input_bit_depth(in_path)
     out_bit_depth = 8 if inferred_bits <= 8 else 16
 
-    vf_chain = [f'fps={args.fps}']
     colorspace_filter = 'colorspace=iall=bt709:all=smpte170m'
     if not args.keep_rec709:
         colorspace_filter += ':trc=iec61966-2-1'
-    if ext in {'jpg', 'jpeg'}:
-        # Keep JPEG outputs in 4:4:4 and match the expected color space.
-        vf_chain.append(f'{colorspace_filter}:range=jpeg:format=yuv444p')
+    if args.fisheye_perspective:
+        focal_mm = max(args.fisheye_focal_mm, 1e-6)
+        size_px = max(args.fisheye_size, 1)
+        projection_map = {
+            'equidistant': 'fisheye',
+            'equisolid': 'equisolid',
+        }
+        input_projection = projection_map.get(args.fisheye_projection, 'fisheye')
+        input_fov_deg = max(1.0, min(360.0, args.fisheye_input_fov))
+        hfov_deg = fov_from_focal_mm(focal_mm, FISHEYE_SENSOR_WIDTH_MM)
+        hfov_deg = max(1.0, min(179.0, hfov_deg))
+        vfov_deg = v_fov_from_hfov(hfov_deg, size_px, size_px)
+        vfov_deg = max(1.0, min(179.0, vfov_deg))
+        v360_filter = (
+            f"v360={input_projection}:rectilinear:"
+            f"ih_fov={input_fov_deg:.6f}:iv_fov={input_fov_deg:.6f}:"
+            f"h_fov={hfov_deg:.6f}:v_fov={vfov_deg:.6f}:interp=cubic"
+        )
+        vf_chain = [v360_filter, f'fps={args.fps}']
+        if ext in {'jpg', 'jpeg'}:
+            vf_chain.append(f'{colorspace_filter}:range=jpeg:format=yuv444p')
+        else:
+            vf_chain.append(f'{colorspace_filter}:format=yuv444p')
+        vf_chain.append(f'scale={size_px}:{size_px}')
     else:
-        # Normalize other outputs to the expected BT.709 color space.
-        vf_chain.append(f'{colorspace_filter}:format=yuv444p')
+        vf_chain = [f'fps={args.fps}']
+        if ext in {'jpg', 'jpeg'}:
+            # Keep JPEG outputs in 4:4:4 and match the expected color space.
+            vf_chain.append(f'{colorspace_filter}:range=jpeg:format=yuv444p')
+        else:
+            # Normalize other outputs to the expected BT.709 color space.
+            vf_chain.append(f'{colorspace_filter}:format=yuv444p')
 
     cmd = [ffmpeg_exec, '-hide_banner', '-y' if args.overwrite else '-n']
     if args.start is not None:
