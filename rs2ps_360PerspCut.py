@@ -290,7 +290,8 @@ def build_ffmpeg_cmd(ffmpeg: str, inp: pathlib.Path, out: pathlib.Path,
                      video_mode: bool = False,
                      fps: Optional[float] = None,
                      keep_rec709: bool = False,
-                     bit_depth: int = 8) -> List[str]:
+                     bit_depth: int = 8,
+                     jpeg_quality_95: bool = False) -> List[str]:
     ext_lower = ext.lower()
     filters: List[str] = []
     if video_mode:
@@ -317,11 +318,14 @@ def build_ffmpeg_cmd(ffmpeg: str, inp: pathlib.Path, out: pathlib.Path,
     else:
         cmd += ["-frames:v", "1"]
     if ext_lower in (".jpg", ".jpeg"):
+        q_value = "1"
+        if jpeg_quality_95:
+            q_value = "2"
         cmd += [
             "-c:v", "mjpeg",
-            "-q:v", "1",
-            "-qmin", "1",
-            "-qmax", "1",
+            "-q:v", q_value,
+            "-qmin", q_value,
+            "-qmax", q_value,
             "-pix_fmt", "yuvj444p",
             "-huffman", "optimal",
         ]
@@ -344,7 +348,8 @@ def build_ffmpeg_equisolid_cmd(ffmpeg: str, inp: pathlib.Path, out: pathlib.Path
                                video_mode: bool = False,
                                fps: Optional[float] = None,
                                keep_rec709: bool = False,
-                               bit_depth: int = 8) -> List[str]:
+                               bit_depth: int = 8,
+                               jpeg_quality_95: bool = False) -> List[str]:
     ext_lower = ext.lower()
     filters: List[str] = []
     if video_mode:
@@ -371,11 +376,14 @@ def build_ffmpeg_equisolid_cmd(ffmpeg: str, inp: pathlib.Path, out: pathlib.Path
     else:
         cmd += ["-frames:v", "1"]
     if ext_lower in (".jpg", ".jpeg"):
+        q_value = "1"
+        if jpeg_quality_95:
+            q_value = "2"
         cmd += [
             "-c:v", "mjpeg",
-            "-q:v", "1",
-            "-qmin", "1",
-            "-qmax", "1",
+            "-q:v", q_value,
+            "-qmin", q_value,
+            "-qmax", q_value,
             "-pix_fmt", "yuvj444p",
             "-huffman", "optimal",
         ]
@@ -439,8 +447,20 @@ def create_arg_parser() -> argparse.ArgumentParser:
         help="Default magnitude in degrees when 'U/D' in --addcam/--setcam omit a value (default 30)"
     )
     ap.add_argument(
-        "--add-topdown", action="store_true",
-        help="Include cube-map style top (pitch +90 deg) and bottom (pitch -90 deg) views"
+        "--add-top",
+        action="store_true",
+        help="Include cube-map style top view (pitch +90 deg)",
+    )
+    ap.add_argument(
+        "--add-bottom",
+        action="store_true",
+        help="Include cube-map style bottom view (pitch -90 deg)",
+    )
+    ap.add_argument(
+        "--add-topdown",
+        action="store_true",
+        dest="add_topdown",
+        help=argparse.SUPPRESS,
     )
     ap.add_argument("--delcam", default="", help="Remove baseline cameras by letter, e.g. 'B,D'")
     ap.add_argument(
@@ -450,6 +470,11 @@ def create_arg_parser() -> argparse.ArgumentParser:
 
     ap.add_argument("--size", type=int, default=1600, action=StoreWithFlag, help="Square output size per view")
     ap.add_argument("--ext", default="jpg", help="Output extension (jpg=high quality mjpeg)")
+    ap.add_argument(
+        "--jpeg-quality-95",
+        action="store_true",
+        help="When set with --ext jpg, encode outputs at approximately 95% JPEG quality instead of maximum.",
+    )
     ap.add_argument(
         "-f", "--fps", type=float, default=None,
         help="Frame extraction rate (fps) when input is a video file"
@@ -557,7 +582,13 @@ def build_view_jobs(args, files: List[pathlib.Path], out_dir: pathlib.Path) -> B
     even_pitch_all = None
     even_pitch_map: Dict[int, float] = {}
 
-    add_topdown = bool(args.add_topdown)
+    add_top = bool(getattr(args, "add_top", False))
+    add_bottom = bool(getattr(args, "add_bottom", False))
+    if getattr(args, "add_topdown", False):
+        add_top = True
+        add_bottom = True
+    setattr(args, "add_top", add_top)
+    setattr(args, "add_bottom", add_bottom)
     preset_fisheye_xy = (args.preset == "fisheyeXY")
     preset_two_views = (args.preset == "2views")
     preset_fisheyelike = (args.preset == "fisheyelike")
@@ -657,6 +688,7 @@ def build_view_jobs(args, files: List[pathlib.Path], out_dir: pathlib.Path) -> B
         fps=fps_value,
         keep_rec709=keep_rec709,
         bit_depth=video_bit_depth,
+        jpeg_quality_95=args.jpeg_quality_95,
     )
 
     def make_out_path(view_id: str) -> pathlib.Path:
@@ -802,9 +834,14 @@ def build_view_jobs(args, files: List[pathlib.Path], out_dir: pathlib.Path) -> B
                     projection="equisolid"
                 )
 
-        if add_topdown:
+        extra_pitches: List[float] = []
+        if add_top:
+            extra_pitches.append(90.0)
+        if add_bottom:
+            extra_pitches.append(-90.0)
+        if extra_pitches:
             td_index = count
-            for td_pitch in (90.0, -90.0):
+            for td_pitch in extra_pitches:
                 td_tag = letter_tag(td_index)
                 td_index += 1
                 pitch_td = clamp(td_pitch, -90.0, 90.0)
