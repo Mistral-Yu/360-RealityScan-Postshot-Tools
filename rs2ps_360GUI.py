@@ -120,7 +120,8 @@ HELP_TEXT = """
 - HFOV (deg): Horizontal FOV (overrides focal length)
 - Focal(mm): Focal length when HFOV is not set
 - Sensor(mm): Sensor width/height (e.g. 36 24 or 36x24)
-- Add top/bottom: Include cube-map style top/bottom views
+- Add top: Include a cube-map style top view (pitch +90 deg)
+- Add bottom: Include a cube-map style bottom view (pitch -90 deg)
 - Video input: Use Browse... to select a video file (mp4/mov/etc.); choose preview FPS and ensure ffmpeg path is configured.
 
 Update: Refresh preview only with the current parameters
@@ -138,7 +139,8 @@ FIELD_HELP_TEXT = {
     "hfov": "Horizontal field-of-view override (degrees). Takes priority over focal length when provided.",
     "sensor_mm": "Sensor width/height (mm). Example: 36 24 or 36x24.",
     "count": "Number of evenly spaced horizontal cameras (360° / count determines yaw step).",
-    "add_topdown": "Enable additional top (+90° pitch) and bottom (-90° pitch) views.",
+    "add_top": "Enable an additional top view at pitch +90°.",
+    "add_bottom": "Enable an additional bottom view at pitch -90°.",
     "input_path": "Select an image folder or Browse to choose a video file (mp4/mov/etc.). For videos, set preview FPS and ensure ffmpeg is configured.",
     "show_seam_overlay": "Overlay a translucent band along the panorama seam to visualise potential stitching artifacts.",
     "ffmpeg": "Path to the ffmpeg executable. Leave blank to use the system PATH.",
@@ -434,11 +436,19 @@ class PreviewApp:
             "required_if_video": True,
         },
         {
-            "name": "add_topdown",
-            "label": "Add top/bottom",
+            "name": "add_top",
+            "label": "Add top",
             "type": "bool",
             "align_with": "count",
             "col_shift": 0,
+            "row_shift": 1,
+        },
+        {
+            "name": "add_bottom",
+            "label": "Add bottom",
+            "type": "bool",
+            "align_with": "count",
+            "col_shift": 2,
             "row_shift": 1,
         },
         {
@@ -454,8 +464,8 @@ class PreviewApp:
             "name": "show_seam_overlay",
             "label": "Show seam hint",
             "type": "bool",
-            "align_with": "ext",
-            "col_shift": 0,
+            "align_with": "count",
+            "col_shift": 4,
             "row_shift": 1,
         },
     ]
@@ -545,6 +555,11 @@ class PreviewApp:
         self.video_log: Optional[tk.Text] = None
         self.video_run_button: Optional[tk.Button] = None
         self.video_inspect_button: Optional[tk.Button] = None
+        self.fisheye_persp_check: Optional[tk.Checkbutton] = None
+        self.fisheye_fov_entry: Optional[tk.Entry] = None
+        self.fisheye_focal_entry: Optional[tk.Entry] = None
+        self.fisheye_size_entry: Optional[tk.Entry] = None
+        self.fisheye_projection_combo: Optional[ttk.Combobox] = None
 
         self.preview_inspect_button: Optional[tk.Button] = None
 
@@ -669,12 +684,23 @@ class PreviewApp:
             "keep_rec709": tk.BooleanVar(value=False),
             "overwrite": tk.BooleanVar(value=False),
             "fisheye_experimental": tk.BooleanVar(value=False),
+            "fisheye_perspective": tk.BooleanVar(value=False),
+            "fisheye_input_fov": tk.StringVar(value="190"),
+            "fisheye_persp_focal": tk.StringVar(value="8"),
+            "fisheye_persp_size": tk.StringVar(value="3840"),
+            "fisheye_projection": tk.StringVar(value="equisolid"),
         }
 
         self.video_vars["video"].trace_add("write", self._on_video_input_changed)
         self.video_vars["output"].trace_add("write", self._on_video_output_changed)
         self.video_vars["fps"].trace_add("write", self._on_video_fps_changed)
         self.video_vars["prefix"].trace_add("write", self._on_video_prefix_changed)
+        self.video_vars["fisheye_experimental"].trace_add(
+            "write", self._on_fisheye_experimental_changed
+        )
+        self.video_vars["fisheye_perspective"].trace_add(
+            "write", self._on_fisheye_perspective_changed
+        )
 
         row = 0
         tk.Label(params, text="Input video").grid(row=row, column=0, sticky="e", padx=4, pady=4)
@@ -734,13 +760,52 @@ class PreviewApp:
             text="Overwrite output",
             variable=self.video_vars["overwrite"],
         ).pack(side=tk.LEFT, padx=(0, 12))
-        tk.Checkbutton(
-            flags_frame,
-            text=(
-                "Experimental: Fisheye extraction (raw video input)"
-            ),
+
+        row += 1
+        experimental_frame = tk.Frame(params)
+        experimental_frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+        fisheye_main_cb = tk.Checkbutton(
+            experimental_frame,
+            text="Experimental: Fisheye extraction (raw video input)",
             variable=self.video_vars["fisheye_experimental"],
-        ).pack(side=tk.LEFT, padx=(0, 12))
+        )
+        fisheye_main_cb.pack(side=tk.LEFT, padx=(0, 12))
+        self.fisheye_persp_check = tk.Checkbutton(
+            experimental_frame,
+            text="Experimental: Dual fisheye to perspective",
+            variable=self.video_vars["fisheye_perspective"],
+        )
+        self.fisheye_persp_check.pack(side=tk.LEFT, padx=(0, 12))
+        tk.Label(experimental_frame, text="Input FOV (deg)").pack(side=tk.LEFT, padx=(0, 4))
+        self.fisheye_fov_entry = tk.Entry(
+            experimental_frame,
+            textvariable=self.video_vars["fisheye_input_fov"],
+            width=6,
+        )
+        self.fisheye_fov_entry.pack(side=tk.LEFT, padx=(0, 12))
+        tk.Label(experimental_frame, text="Output focal (mm, approx)").pack(side=tk.LEFT, padx=(0, 4))
+        self.fisheye_focal_entry = tk.Entry(
+            experimental_frame,
+            textvariable=self.video_vars["fisheye_persp_focal"],
+            width=6,
+        )
+        self.fisheye_focal_entry.pack(side=tk.LEFT, padx=(0, 12))
+        tk.Label(experimental_frame, text="Size (px)").pack(side=tk.LEFT, padx=(0, 4))
+        self.fisheye_size_entry = tk.Entry(
+            experimental_frame,
+            textvariable=self.video_vars["fisheye_persp_size"],
+            width=6,
+        )
+        self.fisheye_size_entry.pack(side=tk.LEFT, padx=(0, 4))
+        tk.Label(experimental_frame, text="Projection").pack(side=tk.LEFT, padx=(8, 4))
+        self.fisheye_projection_combo = ttk.Combobox(
+            experimental_frame,
+            textvariable=self.video_vars["fisheye_projection"],
+            values=("equidistant", "equisolid"),
+            width=12,
+            state="readonly",
+        )
+        self.fisheye_projection_combo.pack(side=tk.LEFT, padx=(0, 4))
 
         for col in range(3):
             params.grid_columnconfigure(col, weight=1 if col == 1 else 0)
@@ -777,6 +842,7 @@ class PreviewApp:
         self._set_text_widget(self.video_log, "")
 
         self._update_video_default_output(force=False)
+        self._update_fisheye_controls()
 
     def _on_video_input_changed(self, *_args) -> None:
         value = self.video_vars.get("video")
@@ -798,6 +864,44 @@ class PreviewApp:
         if self._video_prefix_updating:
             return
         self._video_prefix_auto = False
+
+    def _on_fisheye_experimental_changed(self, *_args) -> None:
+        self._update_fisheye_controls()
+
+    def _on_fisheye_perspective_changed(self, *_args) -> None:
+        self._update_fisheye_controls()
+
+    def _update_fisheye_controls(self) -> None:
+        experimental_var = self.video_vars.get("fisheye_experimental")
+        perspective_var = self.video_vars.get("fisheye_perspective")
+        experimental_on = bool(experimental_var.get()) if experimental_var is not None else False
+        if not experimental_on and perspective_var is not None and perspective_var.get():
+            perspective_var.set(False)
+        perspective_on = experimental_on and bool(perspective_var.get()) if perspective_var is not None else False
+        check = self.fisheye_persp_check
+        if check is not None:
+            state = "normal" if experimental_on else "disabled"
+            try:
+                check.configure(state=state)
+            except tk.TclError:
+                pass
+        entry_state = "normal" if perspective_on else "disabled"
+        for entry in (
+            self.fisheye_fov_entry,
+            self.fisheye_focal_entry,
+            self.fisheye_size_entry,
+        ):
+            if entry is not None:
+                try:
+                    entry.configure(state=entry_state)
+                except tk.TclError:
+                    pass
+        combo = self.fisheye_projection_combo
+        if combo is not None:
+            try:
+                combo.configure(state="readonly" if perspective_on else "disabled")
+            except tk.TclError:
+                pass
 
 
     def _format_fps_for_output(self, fps_value: str) -> Optional[str]:
@@ -2082,11 +2186,33 @@ class PreviewApp:
         def worker() -> None:
             try:
                 if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
+                    terminated = False
+                    if sys.platform.startswith("win"):
+                        pid = process.pid
+                        if pid:
+                            try:
+                                subprocess.run(
+                                    ["taskkill", "/T", "/F", "/PID", str(pid)],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    check=False,
+                                )
+                                terminated = True
+                            except Exception as exc:
+                                if log_widget is not None:
+                                    self.root.after(
+                                        0,
+                                        lambda e=exc: self._append_text_widget(
+                                            log_widget,
+                                            f"[stop] taskkill failed: {e}",
+                                        ),
+                                    )
+                    if not terminated:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
             except Exception as exc:
                 if log_widget is not None:
                     self.root.after(0, lambda e=exc: self._append_text_widget(log_widget, f"[ERR] stop failed: {e}"))
@@ -2219,11 +2345,94 @@ class PreviewApp:
         if bool(self.video_vars["overwrite"].get()):
             base_cmd.append("--overwrite")
 
+        fisheye_enabled = bool(self.video_vars["fisheye_experimental"].get())
+        dual_perspective_enabled = fisheye_enabled and bool(
+            self.video_vars["fisheye_perspective"].get()
+        )
+        dual_focal_value: Optional[float] = None
+        dual_fov_value: Optional[float] = None
+        dual_size_value: Optional[int] = None
+        if dual_perspective_enabled:
+            fov_text = self.video_vars["fisheye_input_fov"].get().strip()
+            if not fov_text:
+                messagebox.showerror(
+                    "rs2ps_Video2Frames",
+                    "Enter an input FOV (degrees) for the dual fisheye perspective option.",
+                )
+                return
+            try:
+                dual_fov_value = float(fov_text)
+            except ValueError:
+                messagebox.showerror(
+                    "rs2ps_Video2Frames",
+                    "Input FOV must be numeric (degrees).",
+                )
+                return
+            if dual_fov_value <= 0.0:
+                messagebox.showerror(
+                    "rs2ps_Video2Frames",
+                    "Input FOV must be greater than zero.",
+                )
+                return
+            focal_text = self.video_vars["fisheye_persp_focal"].get().strip()
+            if not focal_text:
+                messagebox.showerror(
+                    "rs2ps_Video2Frames",
+                    "Enter an output focal length (mm, approximate) for the dual fisheye perspective option.",
+                )
+                return
+            try:
+                dual_focal_value = float(focal_text)
+            except ValueError:
+                messagebox.showerror(
+                    "rs2ps_Video2Frames",
+                    "Output focal must be numeric (mm, approximate value).",
+                )
+                return
+            if dual_focal_value <= 0.0:
+                messagebox.showerror(
+                    "rs2ps_Video2Frames",
+                    "Output focal must be greater than zero.",
+                )
+                return
+            size_text = self.video_vars["fisheye_persp_size"].get().strip()
+            if not size_text:
+                messagebox.showerror(
+                    "rs2ps_Video2Frames",
+                    "Enter an output size (pixels) for the dual fisheye perspective option.",
+                )
+                return
+            try:
+                dual_size_value = int(size_text)
+            except ValueError:
+                messagebox.showerror(
+                    "rs2ps_Video2Frames",
+                    "Output size must be an integer (pixels).",
+                )
+                return
+            if dual_size_value <= 0:
+                messagebox.showerror(
+                    "rs2ps_Video2Frames",
+                    "Output size must be greater than zero.",
+                )
+                return
+            projection_value = self.video_vars["fisheye_projection"].get().strip().lower()
+            if projection_value not in {"equidistant", "equisolid"}:
+                messagebox.showerror(
+                    "rs2ps_Video2Frames",
+                    "Projection must be either 'equidistant' or 'equisolid'.",
+                )
+                return
+            base_cmd.extend(["--fisheye-perspective"])
+            base_cmd.extend(["--fisheye-input-fov", str(dual_fov_value)])
+            base_cmd.extend(["--fisheye-focal-mm", str(dual_focal_value)])
+            base_cmd.extend(["--fisheye-size", str(dual_size_value)])
+            base_cmd.extend(["--fisheye-projection", projection_value])
+
         ffmpeg_path = self.ffmpeg_path_var.get().strip()
         if ffmpeg_path:
             base_cmd.extend(["--ffmpeg", ffmpeg_path])
 
-        fisheye_enabled = bool(self.video_vars["fisheye_experimental"].get())
         if fisheye_enabled:
             cmd_primary = list(base_cmd)
             cmd_secondary = list(base_cmd)
@@ -2239,7 +2448,7 @@ class PreviewApp:
                     cmd_secondary,
                     self.base_dir,
                     False,
-                    "[next] Experimental fisheye (map 0:v:1)",
+                    "[next] Experimental dual fisheye (map 0:v:1)" if dual_perspective_enabled else "[next] Experimental fisheye (map 0:v:1)",
                 ),
             ]
             self._run_cli_command(
@@ -3731,8 +3940,10 @@ class PreviewApp:
             if getattr(self.current_args, "focal_mm_explicit", False) or self.current_args.focal_mm != focal_default:
                 parts.extend(["--focal-mm", str(self.current_args.focal_mm)])
 
-        if getattr(self.current_args, "add_topdown", False):
-            parts.append("--add-topdown")
+        if getattr(self.current_args, "add_top", False):
+            parts.append("--add-top")
+        if getattr(self.current_args, "add_bottom", False):
+            parts.append("--add-bottom")
         if getattr(self.current_args, "jpeg_quality_95", False):
             parts.append("--jpeg-quality-95")
         if self.source_is_video and getattr(self.current_args, "keep_rec709", False):
