@@ -23,9 +23,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageDraw, ImageTk
 except ImportError as exc:  # pragma: no cover - environment guard
     print("[ERR] Pillow (PIL) is required: pip install Pillow", file=sys.stderr)
+    raise SystemExit(1) from exc
+
+try:
+    import numpy as np
+except ImportError as exc:  # pragma: no cover - environment guard
+    print("[ERR] NumPy is required: pip install numpy", file=sys.stderr)
     raise SystemExit(1) from exc
 
 import rs2ps_360PerspCut as cutter
@@ -48,6 +54,28 @@ PRESET_CHOICES = ["default", "fisheyelike", "2views", "evenMinus30", "evenPlus30
 HUMAN_MODE_CHOICES = ["mask", "alpha", "cutout", "keep_person", "remove_person", "inpaint"]
 
 DEFAULT_SELECTOR_CSV_NAME = "selected_image_list.csv"
+
+PLY_VIEW_CANVAS_WIDTH = 960
+PLY_VIEW_CANVAS_HEIGHT = 720
+PLY_VIEW_MAX_POINTS = 1_000_000
+PLY_PROPERTY_TYPES = {
+    "char": ("b", 1, "i1"),
+    "uchar": ("B", 1, "u1"),
+    "int8": ("b", 1, "i1"),
+    "uint8": ("B", 1, "u1"),
+    "short": ("h", 2, "<i2"),
+    "ushort": ("H", 2, "<u2"),
+    "int16": ("h", 2, "<i2"),
+    "uint16": ("H", 2, "<u2"),
+    "int": ("i", 4, "<i4"),
+    "int32": ("i", 4, "<i4"),
+    "uint": ("I", 4, "<u4"),
+    "uint32": ("I", 4, "<u4"),
+    "float": ("f", 4, "<f4"),
+    "float32": ("f", 4, "<f4"),
+    "double": ("d", 8, "<f8"),
+    "float64": ("d", 8, "<f8"),
+}
 
 
 class ToolTip:
@@ -583,6 +611,9 @@ class PreviewApp:
         self.ply_vars: Dict[str, tk.Variable] = {}
         self.ply_log: Optional[tk.Text] = None
         self.ply_run_button: Optional[tk.Button] = None
+        self.ply_input_view_button: Optional[tk.Button] = None
+        self.ply_view_button: Optional[tk.Button] = None
+        self.ply_monochrome_check: Optional[tk.Checkbutton] = None
         self.ply_append_text: Optional[tk.Text] = None
         self.ply_adaptive_weight_entry: Optional[tk.Entry] = None
         self.ply_keep_menu: Optional[ttk.Combobox] = None
@@ -595,6 +626,30 @@ class PreviewApp:
             "Target percent": "percent",
             "Voxel size": "voxel",
         }
+        self._last_ply_output_path: Optional[Path] = None
+        self._ply_viewer_window: Optional[tk.Toplevel] = None
+        self._ply_view_canvas: Optional[tk.Canvas] = None
+        self._ply_canvas_image_id: Optional[int] = None
+        self._ply_canvas_photo: Optional[ImageTk.PhotoImage] = None
+        self._ply_view_info_var = tk.StringVar(value="PLY viewer is idle")
+        self._ply_view_points: Optional[np.ndarray] = None
+        self._ply_view_points_centered: Optional[np.ndarray] = None
+        self._ply_view_colors: Optional[np.ndarray] = None
+        self._ply_view_total_points = 0
+        self._ply_view_sample_step = 1
+        self._ply_view_source_label = "PLY"
+        self._ply_view_yaw = 35.0
+        self._ply_view_pitch = 25.0
+        self._ply_view_zoom = 1.0
+        self._ply_drag_last: Optional[Tuple[int, int]] = None
+        self._ply_view_is_loading = False
+        self._ply_view_load_token: Optional[object] = None
+        self._ply_loader_thread: Optional[threading.Thread] = None
+        self._ply_view_depth_offset = 1.0
+        self._ply_view_max_extent = 1.0
+        self._ply_monochrome_var = tk.BooleanVar(value=True)
+        self._ply_projection_mode = tk.StringVar(value="Orthographic")
+        self._ply_projection_combo: Optional[ttk.Combobox] = None
 
         self.video_stop_button: Optional[tk.Button] = None
         self.selector_stop_button: Optional[tk.Button] = None
@@ -1767,6 +1822,25 @@ class PreviewApp:
 
         actions = tk.Frame(container)
         actions.pack(fill="x", padx=8, pady=(0, 8))
+        self.ply_input_view_button = tk.Button(
+            actions,
+            text="Show Input PLY",
+            command=self._on_show_input_ply,
+        )
+        self.ply_input_view_button.pack(side=tk.LEFT, padx=4, pady=4)
+        self.ply_view_button = tk.Button(
+            actions,
+            text="Show Output PLY",
+            command=self._on_show_ply,
+        )
+        self.ply_view_button.pack(side=tk.LEFT, padx=4, pady=4)
+        self.ply_monochrome_check = tk.Checkbutton(
+            actions,
+            text="Monochrome",
+            variable=self._ply_monochrome_var,
+            command=self._redraw_ply_canvas,
+        )
+        self.ply_monochrome_check.pack(side=tk.LEFT, padx=4, pady=4)
         self.ply_stop_button = tk.Button(
             actions,
             text="Stop",
@@ -2691,6 +2765,11 @@ class PreviewApp:
         output_path = self.ply_vars["output"].get().strip()
         if output_path:
             cmd.extend(["-o", output_path])
+        try:
+            resolved_output = Path(output_path) if output_path else Path(input_path)
+            self._last_ply_output_path = resolved_output.expanduser()
+        except Exception:
+            self._last_ply_output_path = None
 
         mode_label = self.ply_target_mode_var.get()
         mode_key = self._ply_mode_key_map.get(mode_label, "points")
@@ -2751,6 +2830,587 @@ class PreviewApp:
             stop_button=self.ply_stop_button,
             cwd=self.base_dir,
         )
+
+    def _resolve_ply_display_path(self) -> Optional[Path]:
+        candidates: List[Path] = []
+        if self._last_ply_output_path is not None:
+            candidates.append(self._last_ply_output_path)
+        for key in ("output", "input"):
+            var = self.ply_vars.get(key)
+            if var is None:
+                continue
+            text = var.get().strip()
+            if not text:
+                continue
+            try:
+                candidates.append(Path(text).expanduser())
+            except Exception:
+                continue
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0] if candidates else None
+
+    def _get_ply_var_path(self, key: str) -> Optional[Path]:
+        var = self.ply_vars.get(key)
+        if var is None:
+            return None
+        text = var.get().strip()
+        if not text:
+            return None
+        try:
+            return Path(text).expanduser()
+        except Exception:
+            return None
+
+    def _on_show_ply(self) -> None:
+        path = self._resolve_ply_display_path()
+        if path is None:
+            messagebox.showerror("Show PLY", "No PLY path is configured yet.")
+            return
+        self._show_ply_from_path(path, "output")
+
+    def _on_show_input_ply(self) -> None:
+        path = self._get_ply_var_path("input")
+        if path is None:
+            messagebox.showerror("Show PLY", "Input PLY path is not set.")
+            return
+        self._show_ply_from_path(path, "input")
+
+    def _show_ply_from_path(self, path: Path, label: str) -> None:
+        if not path.exists():
+            messagebox.showerror("Show PLY", f"{path} was not found.")
+            return
+        self._ply_view_source_label = label
+        canvas = self._ensure_ply_viewer_window()
+        if canvas is None:
+            messagebox.showerror("Show PLY", "Failed to initialize the PLY viewer window.")
+            return
+        self._ply_view_info_var.set(f"Loading {label} ({path.name}) ...")
+        self._start_ply_async_load(path)
+
+    def _ensure_ply_viewer_window(self) -> Optional[tk.Canvas]:
+        window = self._ply_viewer_window
+        if window is None or not window.winfo_exists():
+            window = tk.Toplevel(self.root)
+            window.title("PLY Viewer")
+            window.geometry(f"{PLY_VIEW_CANVAS_WIDTH + 32}x{PLY_VIEW_CANVAS_HEIGHT + 72}")
+            window.protocol("WM_DELETE_WINDOW", self._close_ply_viewer_window)
+            info_label = tk.Label(window, textvariable=self._ply_view_info_var, anchor="w")
+            info_label.pack(fill="x", padx=12, pady=(8, 0))
+            viewer_controls = tk.Frame(window)
+            viewer_controls.pack(fill="x", padx=12, pady=(4, 0))
+            tk.Checkbutton(
+                viewer_controls,
+                text="Monochrome",
+                variable=self._ply_monochrome_var,
+                command=self._redraw_ply_canvas,
+            ).pack(side=tk.LEFT)
+            tk.Label(viewer_controls, text="Projection").pack(side=tk.LEFT, padx=(12, 4))
+            self._ply_projection_combo = ttk.Combobox(
+                viewer_controls,
+                textvariable=self._ply_projection_mode,
+                values=("Orthographic", "Perspective"),
+                state="readonly",
+                width=14,
+            )
+            self._ply_projection_combo.pack(side=tk.LEFT, padx=(0, 4))
+            self._ply_projection_combo.bind("<<ComboboxSelected>>", self._on_ply_projection_changed)
+            canvas = tk.Canvas(
+                window,
+                width=PLY_VIEW_CANVAS_WIDTH,
+                height=PLY_VIEW_CANVAS_HEIGHT,
+                bg="#101010",
+                highlightthickness=0,
+            )
+            canvas.pack(fill="both", expand=True, padx=12, pady=12)
+            self._ply_canvas_image_id = canvas.create_image(0, 0, anchor="nw")
+            self._ply_view_canvas = canvas
+            self._ply_viewer_window = window
+            canvas.bind("<ButtonPress-1>", self._on_ply_drag_start)
+            canvas.bind("<B1-Motion>", self._on_ply_drag_move)
+            canvas.bind("<ButtonRelease-1>", self._on_ply_drag_end)
+            canvas.bind("<Leave>", self._on_ply_drag_end)
+            canvas.bind("<MouseWheel>", self._on_ply_zoom)
+            canvas.bind("<Button-4>", self._on_ply_zoom)
+            canvas.bind("<Button-5>", self._on_ply_zoom)
+        return self._ply_view_canvas
+
+    def _set_ply_view_loading_state(self, loading: bool) -> None:
+        self._ply_view_is_loading = loading
+        buttons = [self.ply_view_button, self.ply_input_view_button]
+        for button in buttons:
+            if button is None:
+                continue
+            try:
+                button.configure(state="disabled" if loading else "normal")
+            except tk.TclError:
+                pass
+
+    def _start_ply_async_load(self, path: Path) -> None:
+        load_token: object = object()
+        self._ply_view_load_token = load_token
+        self._set_ply_view_loading_state(True)
+        thread = threading.Thread(
+            target=self._load_ply_async,
+            args=(path, load_token),
+            daemon=True,
+        )
+        self._ply_loader_thread = thread
+        thread.start()
+
+    def _load_ply_async(self, path: Path, token: object) -> None:
+        try:
+            points, colors, original_count, sample_step = self._load_binary_ply_points(
+                path,
+                max_points=PLY_VIEW_MAX_POINTS,
+            )
+        except Exception as exc:  # pragma: no cover - UI thread handles dialog
+            self.root.after(0, lambda: self._on_ply_load_error(token, exc))
+            return
+        self.root.after(
+            0,
+            lambda: self._on_ply_load_success(
+                token,
+                path,
+                points,
+                colors,
+                original_count,
+                sample_step,
+            ),
+        )
+
+    def _on_ply_load_success(
+        self,
+        token: object,
+        path: Path,
+        points: np.ndarray,
+        colors: np.ndarray,
+        original_count: int,
+        sample_step: int,
+    ) -> None:
+        if token is not self._ply_view_load_token:
+            return
+        self._set_ply_view_loading_state(False)
+        point_count = int(points.shape[0]) if points.size else 0
+        if point_count == 0:
+            self._ply_view_info_var.set(f"{path.name}: no points")
+            messagebox.showinfo("Show PLY", "No points were available for display.")
+            return
+        mins = points.min(axis=0)
+        maxs = points.max(axis=0)
+        center = (mins + maxs) * 0.5
+        spans = np.maximum(maxs - mins, 1e-6)
+        max_extent = float(np.max(spans))
+        centered_points = (points - center).astype(np.float32, copy=False)
+        self._ply_view_points = points
+        self._ply_view_points_centered = centered_points
+        self._ply_view_colors = colors.astype(np.uint8, copy=False)
+        self._ply_view_max_extent = max_extent
+        self._ply_view_depth_offset = max_extent * 2.5
+        self._ply_view_total_points = original_count
+        self._ply_view_sample_step = max(1, sample_step)
+        self._reset_ply_view_transform()
+        label = self._ply_view_source_label or "PLY"
+        if self._ply_view_sample_step > 1 and original_count > 0:
+            info = (
+                f"{label}: {path.name}  "
+                f"({point_count:,} / {original_count:,} pts, step {self._ply_view_sample_step})"
+            )
+        else:
+            info = f"{label}: {path.name}  ({point_count:,} pts)"
+        self._ply_view_info_var.set(info)
+        canvas = self._ensure_ply_viewer_window()
+        if canvas is not None:
+            self._render_ply_points(canvas)
+
+    def _on_ply_load_error(self, token: object, exc: Exception) -> None:
+        if token is not self._ply_view_load_token:
+            return
+        self._set_ply_view_loading_state(False)
+        self._ply_view_info_var.set("PLY viewer is idle")
+        messagebox.showerror("Show PLY", f"Failed to load the PLY file.\n{exc}")
+
+    def _close_ply_viewer_window(self) -> None:
+        window = self._ply_viewer_window
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+        self._ply_viewer_window = None
+        self._ply_view_canvas = None
+        self._ply_canvas_image_id = None
+        self._ply_canvas_photo = None
+        self._ply_projection_combo = None
+        self._ply_view_info_var.set("PLY viewer is idle")
+        self._ply_view_points = None
+        self._ply_view_points_centered = None
+        self._ply_view_colors = None
+        self._ply_view_total_points = 0
+        self._ply_view_sample_step = 1
+        self._ply_view_source_label = "PLY"
+        self._reset_ply_view_transform()
+
+    def _reset_ply_view_transform(self) -> None:
+        self._ply_view_yaw = 35.0
+        self._ply_view_pitch = 25.0
+        self._ply_view_zoom = 1.0
+        self._ply_drag_last = None
+
+    def _redraw_ply_canvas(self) -> None:
+        canvas = self._ply_view_canvas
+        if canvas is None or not canvas.winfo_exists():
+            return
+        self._render_ply_points(canvas)
+
+    def _on_ply_drag_start(self, event: tk.Event) -> None:
+        if self._ply_view_points_centered is None:
+            return
+        self._ply_drag_last = (event.x, event.y)
+
+    def _on_ply_drag_move(self, event: tk.Event) -> None:
+        if self._ply_drag_last is None or self._ply_view_points_centered is None:
+            return
+        last_x, last_y = self._ply_drag_last
+        dx = event.x - last_x
+        dy = event.y - last_y
+        self._ply_drag_last = (event.x, event.y)
+        self._ply_view_yaw = (self._ply_view_yaw + dx * 0.4) % 360.0
+        self._ply_view_pitch = max(-89.0, min(89.0, self._ply_view_pitch + dy * 0.4))
+        self._redraw_ply_canvas()
+
+    def _on_ply_drag_end(self, _event=None) -> None:
+        self._ply_drag_last = None
+
+    def _on_ply_zoom(self, event: tk.Event) -> Optional[str]:
+        if self._ply_view_points_centered is None:
+            return None
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            num = getattr(event, "num", None)
+            if num == 4:
+                delta = 120
+            elif num == 5:
+                delta = -120
+        if delta == 0:
+            return None
+        factor = 1.0 + (0.12 if delta > 0 else -0.12)
+        new_zoom = self._ply_view_zoom * factor
+        self._ply_view_zoom = max(0.1, min(8.0, new_zoom))
+        self._redraw_ply_canvas()
+        return "break"
+
+    def _on_ply_projection_changed(self, _event=None) -> None:
+        self._redraw_ply_canvas()
+
+    def _load_binary_ply_points(
+        self,
+        path: Path,
+        *,
+        max_points: int = PLY_VIEW_MAX_POINTS,
+    ) -> Tuple[np.ndarray, np.ndarray, int, int]:
+        if max_points <= 0:
+            raise ValueError("max_points must be positive")
+        vertex_count: Optional[int] = None
+        format_token = ""
+        property_defs: List[Tuple[str, str]] = []
+        reading_vertex = False
+        with path.open("rb") as fh:
+            while True:
+                raw = fh.readline()
+                if not raw:
+                    raise ValueError("PLYヘッダーの読み込み中に予期しないEOFになりました。")
+                try:
+                    line = raw.decode("ascii", errors="ignore").strip()
+                except UnicodeDecodeError:
+                    line = raw.decode("latin-1", errors="ignore").strip()
+                if not line:
+                    continue
+                if line.startswith("comment"):
+                    continue
+                if line.startswith("format"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        format_token = parts[1].lower()
+                    continue
+                if line.startswith("element"):
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[1].lower() == "vertex":
+                        vertex_count = int(parts[2])
+                        reading_vertex = True
+                    else:
+                        reading_vertex = False
+                    continue
+                if line.startswith("property") and reading_vertex:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        property_defs.append((parts[1].lower(), parts[2]))
+                    continue
+                if line == "end_header":
+                    break
+            if format_token != "binary_little_endian":
+                raise ValueError("binary_little_endian形式のPLYのみサポートしています。")
+            if vertex_count is None or vertex_count <= 0:
+                raise ValueError("有効なvertex要素が見つかりません。")
+            if not property_defs:
+                raise ValueError("vertex propertyが定義されていません。")
+            dtype_fields: List[Tuple[str, str]] = []
+            available_props: Set[str] = set()
+            for ptype, pname in property_defs:
+                info = PLY_PROPERTY_TYPES.get(ptype)
+                if info is None:
+                    raise ValueError(f"未対応のプロパティ型: {ptype}")
+                dtype_fields.append((pname, info[2]))
+                available_props.add(pname)
+            required_axes = [axis for axis in ("x", "y", "z") if axis not in available_props]
+            if required_axes:
+                raise ValueError(f"座標プロパティが不足しています: {', '.join(required_axes)}")
+            dtype = np.dtype(dtype_fields)
+            stride = dtype.itemsize
+            if stride <= 0:
+                raise ValueError("無効なPLY頂点ストライドです。")
+            vertex_bytes = stride * vertex_count
+            vertex_blob = fh.read(vertex_bytes)
+            if len(vertex_blob) < vertex_bytes:
+                raise ValueError("PLY頂点データの途中でEOFになりました。")
+            data = np.frombuffer(vertex_blob, dtype=dtype).copy()
+        original_count = int(data.shape[0])
+        sample_step = 1
+        if original_count > max_points:
+            sample_step = max(1, int(math.ceil(original_count / max_points)))
+            data = data[::sample_step]
+        xyz = np.stack((data["x"], data["y"], data["z"]), axis=1).astype(np.float32, copy=False)
+        if all(channel in data.dtype.names for channel in ("red", "green", "blue")):
+            colors = np.stack((data["red"], data["green"], data["blue"]), axis=1)
+            if np.issubdtype(colors.dtype, np.floating):
+                colors = self._linear_float_to_srgb888(colors)
+            else:
+                colors = colors.astype(np.uint8, copy=False)
+        else:
+            colors = np.full((xyz.shape[0], 3), 220, dtype=np.uint8)
+        return xyz, colors, original_count, sample_step
+
+    @staticmethod
+    def _linear_float_to_srgb888(values: np.ndarray) -> np.ndarray:
+        """Convert linear float colors (0-1) to sRGB 8-bit."""
+        clipped = np.clip(values, 0.0, 1.0).astype(np.float32, copy=False)
+        threshold = 0.0031308
+        srgb = np.where(
+            clipped <= threshold,
+            clipped * 12.92,
+            1.055 * np.power(clipped, 1.0 / 2.4) - 0.055,
+        )
+        srgb = np.clip(np.rint(srgb * 255.0), 0, 255).astype(np.uint8)
+        return srgb
+
+    def _render_ply_points(
+        self,
+        canvas: tk.Canvas,
+    ) -> None:
+        if self._ply_view_points_centered is None or self._ply_view_colors is None:
+            return
+        canvas.update_idletasks()
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        if width < 10 or height < 10:
+            width = PLY_VIEW_CANVAS_WIDTH
+            height = PLY_VIEW_CANVAS_HEIGHT
+        points = self._ply_view_points_centered
+        colors = self._ply_view_colors
+        if points.size == 0 or colors.size == 0:
+            return
+        depth_offset = max(self._ply_view_depth_offset, 1e-6)
+        yaw = math.radians(self._ply_view_yaw)
+        pitch = math.radians(self._ply_view_pitch)
+        cos_y = math.cos(yaw)
+        sin_y = math.sin(yaw)
+        cos_x = math.cos(pitch)
+        sin_x = math.sin(pitch)
+        proj_scale = min(width, height) * 0.9 * self._ply_view_zoom
+        ortho_scale = self._compute_ortho_scale(width, height)
+        projection_mode = (self._ply_projection_mode.get() or "").lower()
+        is_orthographic = projection_mode.startswith("ortho")
+        x = points[:, 0]
+        y = points[:, 1]
+        z = points[:, 2]
+        x1 = x * cos_y + z * sin_y
+        z1 = -x * sin_y + z * cos_y
+        y1 = y * cos_x - z1 * sin_x
+        z2 = y * sin_x + z1 * cos_x
+        depth = z2 + depth_offset
+        if is_orthographic:
+            valid = np.ones_like(depth, dtype=bool)
+            sx = width / 2.0 + x1 * ortho_scale
+            sy = height / 2.0 - y1 * ortho_scale
+        else:
+            valid = depth > 1e-4
+            scale = np.zeros_like(depth)
+            scale[valid] = proj_scale / depth[valid]
+            sx = width / 2.0 + x1 * scale
+            sy = height / 2.0 - y1 * scale
+        ix = np.rint(sx).astype(np.int32)
+        iy = np.rint(sy).astype(np.int32)
+        valid &= (ix >= 0) & (ix < width) & (iy >= 0) & (iy < height)
+        if not np.any(valid):
+            messagebox.showinfo("Show PLY", "No visible points remained after projection.")
+            return
+        depth_valid = depth[valid]
+        ix_valid = ix[valid]
+        iy_valid = iy[valid]
+        colors_valid = colors[valid]
+        if bool(self._ply_monochrome_var.get()):
+            colors_valid = np.full((colors_valid.shape[0], 3), 255, dtype=np.uint8)
+        pixel_index = (iy_valid * width + ix_valid).astype(np.int64, copy=False)
+        order = np.argsort(depth_valid)[::-1]
+        pixel_order = pixel_index[order]
+        color_order = colors_valid[order]
+        pixel_count = width * height
+        buf = np.full((pixel_count, 3), 0x11, dtype=np.uint8)
+        buf[pixel_order, :] = color_order
+        image_array = buf.reshape((height, width, 3))
+        image = Image.fromarray(image_array, mode="RGB")
+        self._draw_axes_overlay(
+            image,
+            width,
+            height,
+            cos_y,
+            sin_y,
+            cos_x,
+            sin_x,
+            depth_offset,
+            proj_scale,
+            ortho_scale,
+            is_orthographic,
+        )
+        photo = ImageTk.PhotoImage(image=image)
+        self._ply_canvas_photo = photo
+        if self._ply_canvas_image_id is None:
+            self._ply_canvas_image_id = canvas.create_image(0, 0, anchor="nw", image=photo)
+        else:
+            canvas.itemconfigure(self._ply_canvas_image_id, image=photo)
+        canvas.configure(scrollregion=(0, 0, width, height))
+
+    def _compute_ortho_scale(self, width: int, height: int) -> float:
+        max_extent = max(self._ply_view_max_extent, 1e-6)
+        return max(
+            1e-6,
+            self._ply_view_zoom * (min(width, height) * 0.45 / max_extent),
+        )
+
+    def _draw_axes_overlay(
+        self,
+        image: Image.Image,
+        width: int,
+        height: int,
+        cos_y: float,
+        sin_y: float,
+        cos_x: float,
+        sin_x: float,
+        depth_offset: float,
+        proj_scale: float,
+        ortho_scale: float,
+        is_orthographic: bool,
+    ) -> None:
+        axis_len = max(self._ply_view_max_extent * 0.25, 1e-3)
+        origin = (0.0, 0.0, 0.0)
+        axes = {
+            "X": (axis_len, 0.0, 0.0),
+            "Y": (0.0, axis_len, 0.0),
+            "Z": (0.0, 0.0, axis_len),
+        }
+        screen_origin = self._project_point_to_screen(
+            origin,
+            width,
+            height,
+            cos_y,
+            sin_y,
+            cos_x,
+            sin_x,
+            depth_offset,
+            proj_scale,
+            ortho_scale,
+            is_orthographic,
+        )
+        if screen_origin is None:
+            return
+        draw = ImageDraw.Draw(image)
+        colors = {
+            "X": (255, 80, 80),
+            "Y": (80, 255, 120),
+            "Z": (80, 160, 255),
+        }
+        for label, endpoint in axes.items():
+            screen_point = self._project_point_to_screen(
+                endpoint,
+                width,
+                height,
+                cos_y,
+                sin_y,
+                cos_x,
+                sin_x,
+                depth_offset,
+                proj_scale,
+                ortho_scale,
+                is_orthographic,
+            )
+            if screen_point is None:
+                continue
+            color = colors.get(label, (255, 255, 255))
+            draw.line(
+                [screen_origin, screen_point],
+                fill=color,
+                width=2,
+            )
+            draw.text(
+                (screen_point[0] + 4, screen_point[1] - 12),
+                label,
+                fill=color,
+            )
+        r = 4
+        draw.ellipse(
+            [
+                (screen_origin[0] - r, screen_origin[1] - r),
+                (screen_origin[0] + r, screen_origin[1] + r),
+            ],
+            fill=(255, 255, 255),
+        )
+        axis_text = f"Axis scale: {axis_len:.2f} cm"
+        draw.text(
+            (12, height - 24),
+            axis_text,
+            fill=(255, 255, 255),
+        )
+
+    @staticmethod
+    def _project_point_to_screen(
+        point: Tuple[float, float, float],
+        width: int,
+        height: int,
+        cos_y: float,
+        sin_y: float,
+        cos_x: float,
+        sin_x: float,
+        depth_offset: float,
+        proj_scale: float,
+        ortho_scale: float,
+        is_orthographic: bool,
+    ) -> Optional[Tuple[float, float]]:
+        px, py, pz = point
+        x1 = px * cos_y + pz * sin_y
+        z1 = -px * sin_y + pz * cos_y
+        y1 = py * cos_x - z1 * sin_x
+        z2 = py * sin_x + z1 * cos_x
+        depth = z2 + depth_offset
+        if is_orthographic:
+            scale = ortho_scale
+        else:
+            if depth <= 1e-4:
+                return None
+            scale = proj_scale / depth
+        sx = width / 2.0 + x1 * scale
+        sy = height / 2.0 - y1 * scale
+        return sx, sy
 
     def _select_file(
         self,
