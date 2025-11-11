@@ -18,7 +18,7 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -613,7 +613,6 @@ class PreviewApp:
         self.ply_run_button: Optional[tk.Button] = None
         self.ply_input_view_button: Optional[tk.Button] = None
         self.ply_view_button: Optional[tk.Button] = None
-        self.ply_monochrome_check: Optional[tk.Checkbutton] = None
         self.ply_append_text: Optional[tk.Text] = None
         self.ply_adaptive_weight_entry: Optional[tk.Entry] = None
         self.ply_keep_menu: Optional[ttk.Combobox] = None
@@ -647,9 +646,16 @@ class PreviewApp:
         self._ply_loader_thread: Optional[threading.Thread] = None
         self._ply_view_depth_offset = 1.0
         self._ply_view_max_extent = 1.0
-        self._ply_monochrome_var = tk.BooleanVar(value=True)
+        self._ply_monochrome_var = tk.BooleanVar(value=False)
         self._ply_projection_mode = tk.StringVar(value="Orthographic")
         self._ply_projection_combo: Optional[ttk.Combobox] = None
+        self._ply_sky_axis_var = tk.StringVar(value="+Z")
+        self._ply_sky_scale_var = tk.StringVar(value="100")
+        self._ply_sky_count_var = tk.StringVar(value="4000")
+        self._ply_sky_color_var = tk.StringVar(value="#87cefa")
+        self._ply_sky_color_rgb_var = tk.StringVar(value="RGB(135, 206, 250)")
+        self._ply_sky_points: Optional[np.ndarray] = None
+        self._ply_sky_colors: Optional[np.ndarray] = None
 
         self.video_stop_button: Optional[tk.Button] = None
         self.selector_stop_button: Optional[tk.Button] = None
@@ -1834,13 +1840,6 @@ class PreviewApp:
             command=self._on_show_ply,
         )
         self.ply_view_button.pack(side=tk.LEFT, padx=4, pady=4)
-        self.ply_monochrome_check = tk.Checkbutton(
-            actions,
-            text="Monochrome",
-            variable=self._ply_monochrome_var,
-            command=self._redraw_ply_canvas,
-        )
-        self.ply_monochrome_check.pack(side=tk.LEFT, padx=4, pady=4)
         self.ply_stop_button = tk.Button(
             actions,
             text="Stop",
@@ -2898,17 +2897,17 @@ class PreviewApp:
             window.protocol("WM_DELETE_WINDOW", self._close_ply_viewer_window)
             info_label = tk.Label(window, textvariable=self._ply_view_info_var, anchor="w")
             info_label.pack(fill="x", padx=12, pady=(8, 0))
-            viewer_controls = tk.Frame(window)
-            viewer_controls.pack(fill="x", padx=12, pady=(4, 0))
+            top_controls = tk.Frame(window)
+            top_controls.pack(fill="x", padx=12, pady=(4, 0))
             tk.Checkbutton(
-                viewer_controls,
+                top_controls,
                 text="Monochrome",
                 variable=self._ply_monochrome_var,
                 command=self._redraw_ply_canvas,
             ).pack(side=tk.LEFT)
-            tk.Label(viewer_controls, text="Projection").pack(side=tk.LEFT, padx=(12, 4))
+            tk.Label(top_controls, text="Projection").pack(side=tk.LEFT, padx=(12, 4))
             self._ply_projection_combo = ttk.Combobox(
-                viewer_controls,
+                top_controls,
                 textvariable=self._ply_projection_mode,
                 values=("Orthographic", "Perspective"),
                 state="readonly",
@@ -2916,6 +2915,60 @@ class PreviewApp:
             )
             self._ply_projection_combo.pack(side=tk.LEFT, padx=(0, 4))
             self._ply_projection_combo.bind("<<ComboboxSelected>>", self._on_ply_projection_changed)
+            sky_controls = tk.Frame(window)
+            sky_controls.pack(fill="x", padx=12, pady=(4, 0))
+            axis_options = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
+            tk.Label(sky_controls, text="Sky axis").pack(side=tk.LEFT, padx=(0, 4))
+            axis_combo = ttk.Combobox(
+                sky_controls,
+                textvariable=self._ply_sky_axis_var,
+                values=axis_options,
+                state="readonly",
+                width=6,
+            )
+            axis_combo.pack(side=tk.LEFT)
+            tk.Label(sky_controls, text="Sky scale").pack(side=tk.LEFT, padx=(12, 4))
+            sky_scale_entry = tk.Entry(
+                sky_controls,
+                textvariable=self._ply_sky_scale_var,
+                width=8,
+            )
+            sky_scale_entry.pack(side=tk.LEFT)
+            tk.Label(sky_controls, text="Sky points").pack(side=tk.LEFT, padx=(12, 4))
+            sky_count_entry = tk.Entry(
+                sky_controls,
+                textvariable=self._ply_sky_count_var,
+                width=10,
+            )
+            sky_count_entry.pack(side=tk.LEFT)
+            tk.Label(sky_controls, text="Sky color").pack(side=tk.LEFT, padx=(12, 4))
+            sky_color_entry = tk.Entry(
+                sky_controls,
+                textvariable=self._ply_sky_color_var,
+                width=10,
+            )
+            sky_color_entry.pack(side=tk.LEFT)
+            sky_color_display = tk.Label(
+                sky_controls,
+                textvariable=self._ply_sky_color_rgb_var,
+                fg="#87cefa",
+            )
+            sky_color_display.pack(side=tk.LEFT, padx=(4, 4))
+            tk.Button(
+                sky_controls,
+                text="Pick…",
+                command=self._on_pick_sky_color,
+            ).pack(side=tk.LEFT, padx=(4, 12))
+            tk.Button(
+                sky_controls,
+                text="Add Sky PointClouds (Preview)",
+                command=self._on_add_sky_points,
+            ).pack(side=tk.LEFT, padx=(12, 4))
+            tk.Button(
+                sky_controls,
+                text="Clear",
+                command=self._on_clear_sky_points,
+            ).pack(side=tk.LEFT)
             canvas = tk.Canvas(
                 window,
                 width=PLY_VIEW_CANVAS_WIDTH,
@@ -3047,6 +3100,8 @@ class PreviewApp:
         self._ply_view_points = None
         self._ply_view_points_centered = None
         self._ply_view_colors = None
+        self._ply_sky_points = None
+        self._ply_sky_colors = None
         self._ply_view_total_points = 0
         self._ply_view_sample_step = 1
         self._ply_view_source_label = "PLY"
@@ -3103,6 +3158,184 @@ class PreviewApp:
 
     def _on_ply_projection_changed(self, _event=None) -> None:
         self._redraw_ply_canvas()
+
+    def _generate_sky_points(
+        self,
+        axis_label: str,
+        scale: float,
+        count: int,
+        color_rgb: Tuple[int, int, int],
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        direction_map = {
+            "+X": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            "-X": np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+            "+Y": np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            "-Y": np.array([0.0, -1.0, 0.0], dtype=np.float32),
+            "+Z": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            "-Z": np.array([0.0, 0.0, -1.0], dtype=np.float32),
+        }
+        direction = direction_map.get(axis_label.upper())
+        if direction is None:
+            return None, None
+        count = max(1000, min(20000, int(count)))
+        indices = np.arange(count, dtype=np.float32)
+        phi = math.pi * (3.0 - math.sqrt(5.0))
+        z = 1.0 - indices / count
+        radius = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+        x = np.cos(phi * indices) * radius
+        y = np.sin(phi * indices) * radius
+        points = np.stack((x, y, z), axis=1)
+        points *= float(scale)
+        rotation = self._rotation_matrix_from_vectors(np.array([0.0, 0.0, 1.0], dtype=np.float32), direction)
+        rotated = points @ rotation.T
+        colors = np.tile(np.array(color_rgb, dtype=np.uint8), (rotated.shape[0], 1))
+        return rotated.astype(np.float32, copy=False), colors
+
+    def _parse_color_to_rgb(self, value: str) -> Optional[Tuple[int, int, int]]:
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            r, g, b = self.root.winfo_rgb(text)
+            return (
+                min(255, max(0, r // 256)),
+                min(255, max(0, g // 256)),
+                min(255, max(0, b // 256)),
+            )
+        except tk.TclError:
+            pass
+        raw = text[1:] if text.startswith("#") else text
+        if len(raw) == 3:
+            raw = "".join(ch * 2 for ch in raw)
+        if len(raw) != 6:
+            return None
+        try:
+            r = int(raw[0:2], 16)
+            g = int(raw[2:4], 16)
+            b = int(raw[4:6], 16)
+        except ValueError:
+            return None
+        return (r, g, b)
+
+    def _update_sky_color_display(self, rgb: Tuple[int, int, int], hex_value: str) -> None:
+        self._ply_sky_color_rgb_var.set(f"RGB({rgb[0]}, {rgb[1]}, {rgb[2]})")
+        label = None
+        if self._ply_viewer_window is not None:
+            for child in self._ply_viewer_window.winfo_children():
+                for grandchild in getattr(child, "winfo_children", lambda: [])():
+                    if (
+                        isinstance(grandchild, tk.Label)
+                        and grandchild.cget("textvariable") == str(self._ply_sky_color_rgb_var)
+                    ):
+                        label = grandchild
+                        break
+                if label is not None:
+                    break
+        if label is not None:
+            hex_clean = hex_value if hex_value.startswith("#") else f"#{hex_value}"
+            try:
+                label.configure(fg=hex_clean)
+            except tk.TclError:
+                pass
+
+    @staticmethod
+    def _rotation_matrix_from_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+        src = source / max(np.linalg.norm(source), 1e-6)
+        tgt = target / max(np.linalg.norm(target), 1e-6)
+        c = np.dot(src, tgt)
+        if c > 0.9999:
+            return np.eye(3, dtype=np.float32)
+        if c < -0.9999:
+            axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            if abs(src[0]) > 0.9:
+                axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            axis -= axis.dot(src) * src
+            axis /= max(np.linalg.norm(axis), 1e-6)
+            return PreviewApp._rotation_matrix_from_axis(axis, math.pi)
+        v = np.cross(src, tgt)
+        s = np.linalg.norm(v)
+        vx = np.array(
+            [
+                [0.0, -v[2], v[1]],
+                [v[2], 0.0, -v[0]],
+                [-v[1], v[0], 0.0],
+            ],
+            dtype=np.float32,
+        )
+        r = np.eye(3, dtype=np.float32) + vx + (vx @ vx) * ((1.0 - c) / (s * s))
+        return r.astype(np.float32)
+
+    @staticmethod
+    def _rotation_matrix_from_axis(axis: np.ndarray, angle: float) -> np.ndarray:
+        axis = axis / max(np.linalg.norm(axis), 1e-6)
+        x, y, z = axis
+        c = math.cos(angle)
+        s = math.sin(angle)
+        C = 1.0 - c
+        return np.array(
+            [
+                [c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+                [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+                [z * x * C - y * s, z * y * C + x * s, c + z * z * C],
+            ],
+            dtype=np.float32,
+        )
+
+    def _on_add_sky_points(self) -> None:
+        if self._ply_view_points_centered is None:
+            messagebox.showerror("Sky PointCloud", "Load a PLY before adding sky points.")
+            return
+        axis_label = (self._ply_sky_axis_var.get() or "+Z").upper()
+        scale_text = self._ply_sky_scale_var.get().strip() or "100"
+        try:
+            scale_value = float(scale_text)
+        except ValueError:
+            messagebox.showerror("Sky PointCloud", "Sky Scale must be numeric.")
+            return
+        if scale_value <= 0:
+            messagebox.showerror("Sky PointCloud", "Sky Scale must be greater than zero.")
+            return
+        count_text = self._ply_sky_count_var.get().strip() or "4000"
+        try:
+            count_value = int(float(count_text))
+        except ValueError:
+            messagebox.showerror("Sky PointCloud", "Sky points must be numeric.")
+            return
+        if count_value <= 0:
+            messagebox.showerror("Sky PointCloud", "Sky points must be greater than zero.")
+            return
+        color_text = self._ply_sky_color_var.get().strip() or "#87cefa"
+        color_rgb = self._parse_color_to_rgb(color_text)
+        if color_rgb is None:
+            messagebox.showerror("Sky PointCloud", "Sky color must be a valid color (e.g., #87cefa).")
+            return
+        self._update_sky_color_display(color_rgb, color_text)
+        points, colors = self._generate_sky_points(axis_label, scale_value, count_value, color_rgb)
+        if points is None or colors is None:
+            messagebox.showerror("Sky PointCloud", "Failed to generate sky points. Check axis selection.")
+            return
+        self._ply_sky_points = points
+        self._ply_sky_colors = colors
+        self._redraw_ply_canvas()
+
+    def _on_clear_sky_points(self) -> None:
+        if self._ply_sky_points is None and self._ply_sky_colors is None:
+            return
+        self._ply_sky_points = None
+        self._ply_sky_colors = None
+        self._redraw_ply_canvas()
+
+    def _on_pick_sky_color(self) -> None:
+        initial = self._ply_sky_color_var.get().strip() or "#87cefa"
+        try:
+            _, initial_hex = colorchooser.askcolor(color=initial, title="Sky Color")
+        except tk.TclError:
+            initial_hex = None
+        if initial_hex:
+            self._ply_sky_color_var.set(initial_hex)
+            rgb = self._parse_color_to_rgb(initial_hex)
+            if rgb is not None:
+                self._update_sky_color_display(rgb, initial_hex)
 
     def _load_binary_ply_points(
         self,
@@ -3218,6 +3451,9 @@ class PreviewApp:
             height = PLY_VIEW_CANVAS_HEIGHT
         points = self._ply_view_points_centered
         colors = self._ply_view_colors
+        if self._ply_sky_points is not None and self._ply_sky_colors is not None:
+            points = np.concatenate((points, self._ply_sky_points), axis=0)
+            colors = np.concatenate((colors, self._ply_sky_colors), axis=0)
         if points.size == 0 or colors.size == 0:
             return
         depth_offset = max(self._ply_view_depth_offset, 1e-6)
