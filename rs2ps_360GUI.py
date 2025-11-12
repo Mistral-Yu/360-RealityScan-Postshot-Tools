@@ -626,6 +626,7 @@ class PreviewApp:
             "Voxel size": "voxel",
         }
         self._last_ply_output_path: Optional[Path] = None
+        self._ply_current_file_path: Optional[Path] = None
         self._ply_viewer_window: Optional[tk.Toplevel] = None
         self._ply_view_canvas: Optional[tk.Canvas] = None
         self._ply_canvas_image_id: Optional[int] = None
@@ -634,6 +635,7 @@ class PreviewApp:
         self._ply_view_points: Optional[np.ndarray] = None
         self._ply_view_points_centered: Optional[np.ndarray] = None
         self._ply_view_colors: Optional[np.ndarray] = None
+        self._ply_view_center = np.zeros(3, dtype=np.float32)
         self._ply_view_total_points = 0
         self._ply_view_sample_step = 1
         self._ply_view_source_label = "PLY"
@@ -654,6 +656,8 @@ class PreviewApp:
         self._ply_sky_count_var = tk.StringVar(value="4000")
         self._ply_sky_color_var = tk.StringVar(value="#87cefa")
         self._ply_sky_color_rgb_var = tk.StringVar(value="RGB(135, 206, 250)")
+        self._ply_sky_color_label: Optional[tk.Label] = None
+        self._ply_sky_save_path_var = tk.StringVar()
         self._ply_sky_points: Optional[np.ndarray] = None
         self._ply_sky_colors: Optional[np.ndarray] = None
 
@@ -2241,6 +2245,11 @@ class PreviewApp:
                 if mode_var is not None:
                     mode_now = mode_var.get().strip()
             if pending and not stopped and rc == 0 and mode_now in {"write", "apply", "reselect"}:
+                if mode_now.lower() == "write" and self.selector_vars:
+                    csv_mode_var = self.selector_vars.get("csv_mode")
+                    if csv_mode_var is not None:
+                        csv_mode_var.set("reselect")
+                        self._on_selector_csv_mode_changed()
                 self.root.after(100, self._show_selector_scores)
 
     def _stop_cli_process(self, key: str) -> None:
@@ -2954,20 +2963,50 @@ class PreviewApp:
                 fg="#87cefa",
             )
             sky_color_display.pack(side=tk.LEFT, padx=(4, 4))
+            self._ply_sky_color_label = sky_color_display
+            self._update_sky_color_display((135, 206, 250), self._ply_sky_color_var.get())
             tk.Button(
                 sky_controls,
-                text="Pick…",
+                text="Pick Sky Color",
                 command=self._on_pick_sky_color,
-            ).pack(side=tk.LEFT, padx=(4, 12))
+            ).pack(side=tk.LEFT, padx=(4, 4))
             tk.Button(
                 sky_controls,
+                text="Auto Pick Sky Color",
+                command=self._on_auto_pick_sky_color,
+            ).pack(side=tk.LEFT, padx=(4, 0))
+            sky_action_controls = tk.Frame(window)
+            sky_action_controls.pack(fill="x", padx=12, pady=(4, 0))
+            button_row = tk.Frame(sky_action_controls)
+            button_row.pack(side=tk.LEFT, padx=(0, 12))
+            tk.Button(
+                button_row,
                 text="Add Sky PointClouds (Preview)",
                 command=self._on_add_sky_points,
-            ).pack(side=tk.LEFT, padx=(12, 4))
+            ).pack(side=tk.LEFT, padx=(0, 12))
             tk.Button(
-                sky_controls,
+                button_row,
                 text="Clear",
                 command=self._on_clear_sky_points,
+            ).pack(side=tk.LEFT)
+            save_row = tk.Frame(sky_action_controls)
+            save_row.pack(side=tk.LEFT, fill="x", expand=True)
+            tk.Label(save_row, text="Save w/ sky").pack(side=tk.LEFT, padx=(0, 4))
+            sky_save_entry = tk.Entry(
+                save_row,
+                textvariable=self._ply_sky_save_path_var,
+                width=40,
+            )
+            sky_save_entry.pack(side=tk.LEFT, fill="x", expand=True)
+            tk.Button(
+                save_row,
+                text="Browse...",
+                command=self._on_browse_sky_save_path,
+            ).pack(side=tk.LEFT, padx=(4, 4))
+            tk.Button(
+                save_row,
+                text="Save",
+                command=self._on_save_sky_points,
             ).pack(side=tk.LEFT)
             canvas = tk.Canvas(
                 window,
@@ -3050,10 +3089,8 @@ class PreviewApp:
             self._ply_view_info_var.set(f"{path.name}: no points")
             messagebox.showinfo("Show PLY", "No points were available for display.")
             return
-        mins = points.min(axis=0)
-        maxs = points.max(axis=0)
-        center = (mins + maxs) * 0.5
-        spans = np.maximum(maxs - mins, 1e-6)
+        center = np.zeros(3, dtype=np.float32)
+        spans = np.maximum(points.max(axis=0) - points.min(axis=0), 1e-6)
         max_extent = float(np.max(spans))
         centered_points = (points - center).astype(np.float32, copy=False)
         self._ply_view_points = points
@@ -3061,6 +3098,8 @@ class PreviewApp:
         self._ply_view_colors = colors.astype(np.uint8, copy=False)
         self._ply_view_max_extent = max_extent
         self._ply_view_depth_offset = max_extent * 2.5
+        self._ply_view_center = center.astype(np.float32, copy=False)
+        self._ply_current_file_path = path
         self._ply_view_total_points = original_count
         self._ply_view_sample_step = max(1, sample_step)
         self._reset_ply_view_transform()
@@ -3073,6 +3112,9 @@ class PreviewApp:
         else:
             info = f"{label}: {path.name}  ({point_count:,} pts)"
         self._ply_view_info_var.set(info)
+        self._update_sky_save_default(path)
+        default_sky_count = max(1, int(round(original_count * 0.05)))
+        self._ply_sky_count_var.set(str(default_sky_count))
         canvas = self._ensure_ply_viewer_window()
         if canvas is not None:
             self._render_ply_points(canvas)
@@ -3096,15 +3138,19 @@ class PreviewApp:
         self._ply_canvas_image_id = None
         self._ply_canvas_photo = None
         self._ply_projection_combo = None
+        self._ply_sky_color_label = None
         self._ply_view_info_var.set("PLY viewer is idle")
         self._ply_view_points = None
         self._ply_view_points_centered = None
         self._ply_view_colors = None
+        self._ply_view_center = np.zeros(3, dtype=np.float32)
         self._ply_sky_points = None
         self._ply_sky_colors = None
         self._ply_view_total_points = 0
         self._ply_view_sample_step = 1
         self._ply_view_source_label = "PLY"
+        self._ply_current_file_path = None
+        self._ply_sky_save_path_var.set("")
         self._reset_ply_view_transform()
 
     def _reset_ply_view_transform(self) -> None:
@@ -3159,13 +3205,8 @@ class PreviewApp:
     def _on_ply_projection_changed(self, _event=None) -> None:
         self._redraw_ply_canvas()
 
-    def _generate_sky_points(
-        self,
-        axis_label: str,
-        scale: float,
-        count: int,
-        color_rgb: Tuple[int, int, int],
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    @staticmethod
+    def _axis_direction(axis_label: str) -> Optional[np.ndarray]:
         direction_map = {
             "+X": np.array([1.0, 0.0, 0.0], dtype=np.float32),
             "-X": np.array([-1.0, 0.0, 0.0], dtype=np.float32),
@@ -3174,7 +3215,22 @@ class PreviewApp:
             "+Z": np.array([0.0, 0.0, 1.0], dtype=np.float32),
             "-Z": np.array([0.0, 0.0, -1.0], dtype=np.float32),
         }
-        direction = direction_map.get(axis_label.upper())
+        direction = direction_map.get((axis_label or "").upper())
+        if direction is None:
+            return None
+        norm = np.linalg.norm(direction)
+        if norm > 0:
+            direction = direction / norm
+        return direction
+
+    def _generate_sky_points(
+        self,
+        axis_label: str,
+        scale: float,
+        count: int,
+        color_rgb: Tuple[int, int, int],
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        direction = self._axis_direction(axis_label)
         if direction is None:
             return None, None
         count = max(1000, min(20000, int(count)))
@@ -3219,18 +3275,7 @@ class PreviewApp:
 
     def _update_sky_color_display(self, rgb: Tuple[int, int, int], hex_value: str) -> None:
         self._ply_sky_color_rgb_var.set(f"RGB({rgb[0]}, {rgb[1]}, {rgb[2]})")
-        label = None
-        if self._ply_viewer_window is not None:
-            for child in self._ply_viewer_window.winfo_children():
-                for grandchild in getattr(child, "winfo_children", lambda: [])():
-                    if (
-                        isinstance(grandchild, tk.Label)
-                        and grandchild.cget("textvariable") == str(self._ply_sky_color_rgb_var)
-                    ):
-                        label = grandchild
-                        break
-                if label is not None:
-                    break
+        label = self._ply_sky_color_label
         if label is not None:
             hex_clean = hex_value if hex_value.startswith("#") else f"#{hex_value}"
             try:
@@ -3337,14 +3382,164 @@ class PreviewApp:
             if rgb is not None:
                 self._update_sky_color_display(rgb, initial_hex)
 
+    def _on_auto_pick_sky_color(self) -> None:
+        if self._ply_view_points_centered is None or self._ply_view_colors is None:
+            messagebox.showerror("Sky PointCloud", "Load a PLY before auto picking a color.")
+            return
+        direction = self._axis_direction(self._ply_sky_axis_var.get() or "+Z")
+        if direction is None:
+            messagebox.showerror("Sky PointCloud", "Invalid axis selection for auto color.")
+            return
+        points = self._ply_view_points_centered
+        colors = self._ply_view_colors
+        if points.size == 0 or colors.size == 0:
+            messagebox.showerror("Sky PointCloud", "No points available to sample color.")
+            return
+        norms = np.linalg.norm(points, axis=1)
+        dots = points @ direction
+        cos_vals = np.zeros_like(dots)
+        valid = norms > 1e-9
+        cos_vals[valid] = dots[valid] / norms[valid]
+        mask = (cos_vals >= math.cos(math.radians(45.0))) & valid
+        candidate_indices = np.where(mask)[0]
+        if candidate_indices.size < 10:
+            candidate_indices = np.where(dots > 0)[0]
+        if candidate_indices.size == 0:
+            messagebox.showerror("Sky PointCloud", "Not enough points in that direction to sample color.")
+            return
+        sample = min(200, candidate_indices.size)
+        farthest = candidate_indices[np.argsort(norms[candidate_indices])]
+        chosen = farthest[-sample:]
+        avg_color = colors[chosen].mean(axis=0)
+        rgb = tuple(int(round(val)) for val in avg_color)
+        hex_value = "#{:02x}{:02x}{:02x}".format(*rgb)
+        self._ply_sky_color_var.set(hex_value)
+        self._update_sky_color_display(rgb, hex_value)
+        if self._ply_sky_colors is not None:
+            self._ply_sky_colors[:] = np.array(rgb, dtype=np.uint8)
+            self._redraw_ply_canvas()
+
+    def _update_sky_save_default(self, source_path: Path) -> None:
+        suffix = source_path.suffix or ".ply"
+        candidate = source_path.with_name(f"{source_path.stem}_with_sky_points{suffix}")
+        self._ply_sky_save_path_var.set(str(candidate))
+
+    def _on_browse_sky_save_path(self) -> None:
+        initial = self._ply_sky_save_path_var.get().strip()
+        if initial:
+            try:
+                initial_dir = Path(initial).expanduser().parent
+            except Exception:
+                initial_dir = self.base_dir
+        else:
+            initial_dir = (
+                self._ply_current_file_path.parent
+                if self._ply_current_file_path is not None
+                else self.base_dir
+            )
+        try:
+            if not initial_dir.exists():
+                initial_dir = self.base_dir
+        except Exception:
+            initial_dir = self.base_dir
+        path = filedialog.asksaveasfilename(
+            title="Save PLY with sky points",
+            initialdir=str(initial_dir),
+            defaultextension=".ply",
+            filetypes=[("PLY files", "*.ply"), ("All files", "*.*")],
+        )
+        if path:
+            self._ply_sky_save_path_var.set(path)
+
+    def _on_save_sky_points(self) -> None:
+        if self._ply_view_points is None or self._ply_view_colors is None:
+            messagebox.showerror("Sky PointCloud", "Load a PLY before saving.")
+            return
+        if self._ply_sky_points is None or self._ply_sky_colors is None:
+            messagebox.showerror("Sky PointCloud", "Add sky points before saving.")
+            return
+        dest_text = self._ply_sky_save_path_var.get().strip()
+        if not dest_text:
+            messagebox.showerror("Sky PointCloud", "Specify a save path first.")
+            return
+        dest_path = Path(dest_text).expanduser()
+        try:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            messagebox.showerror("Sky PointCloud", f"Failed to prepare destination.\n{exc}")
+            return
+        try:
+            self._write_binary_ply_with_sky(dest_path)
+        except Exception as exc:
+            messagebox.showerror("Sky PointCloud", f"Failed to save PLY.\n{exc}")
+            return
+        messagebox.showinfo("Sky PointCloud", f"Saved with sky points:\n{dest_path}")
+
+    def _write_binary_ply_with_sky(self, path: Path) -> None:
+        source_path = self._ply_current_file_path
+        if source_path is None:
+            raise ValueError("Original PLY path is unavailable.")
+        base_points, base_colors, _, _ = self._load_binary_ply_points(
+            source_path,
+            max_points=None,
+        )
+        sky_points = self._ply_sky_points
+        sky_colors = self._ply_sky_colors
+        if (
+            base_points is None
+            or base_colors is None
+            or sky_points is None
+            or sky_colors is None
+        ):
+            raise ValueError("Missing point cloud data for saving.")
+        center = self._ply_view_center
+        if not isinstance(center, np.ndarray):
+            center = np.zeros(3, dtype=np.float32)
+        sky_world = sky_points + center
+        xyz = np.concatenate([base_points, sky_world], axis=0).astype(np.float32, copy=False)
+        rgb = np.concatenate([base_colors, sky_colors], axis=0).astype(np.uint8, copy=False)
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {xyz.shape[0]}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "end_header\n"
+        )
+        data = np.empty(
+            xyz.shape[0],
+            dtype=[
+                ("x", "<f4"),
+                ("y", "<f4"),
+                ("z", "<f4"),
+                ("red", "u1"),
+                ("green", "u1"),
+                ("blue", "u1"),
+            ],
+        )
+        data["x"] = xyz[:, 0]
+        data["y"] = xyz[:, 1]
+        data["z"] = xyz[:, 2]
+        data["red"] = rgb[:, 0]
+        data["green"] = rgb[:, 1]
+        data["blue"] = rgb[:, 2]
+        with path.open("wb") as fh:
+            fh.write(header.encode("ascii"))
+            fh.write(data.tobytes())
+
+
     def _load_binary_ply_points(
         self,
         path: Path,
         *,
-        max_points: int = PLY_VIEW_MAX_POINTS,
+        max_points: Optional[int] = PLY_VIEW_MAX_POINTS,
     ) -> Tuple[np.ndarray, np.ndarray, int, int]:
-        if max_points <= 0:
-            raise ValueError("max_points must be positive")
+        if max_points is not None and max_points < 0:
+            raise ValueError("max_points must be >= 0")
         vertex_count: Optional[int] = None
         format_token = ""
         property_defs: List[Tuple[str, str]] = []
@@ -3410,9 +3605,10 @@ class PreviewApp:
             data = np.frombuffer(vertex_blob, dtype=dtype).copy()
         original_count = int(data.shape[0])
         sample_step = 1
-        if original_count > max_points:
-            sample_step = max(1, int(math.ceil(original_count / max_points)))
-            data = data[::sample_step]
+        if max_points:
+            if original_count > max_points:
+                sample_step = max(1, int(math.ceil(original_count / max_points)))
+                data = data[::sample_step]
         xyz = np.stack((data["x"], data["y"], data["z"]), axis=1).astype(np.float32, copy=False)
         if all(channel in data.dtype.names for channel in ("red", "green", "blue")):
             colors = np.stack((data["red"], data["green"], data["blue"]), axis=1)
@@ -3611,7 +3807,7 @@ class PreviewApp:
             ],
             fill=(255, 255, 255),
         )
-        axis_text = f"Axis scale: {axis_len:.2f} cm"
+        axis_text = f"Axis scale: {axis_len:.2f}"
         draw.text(
             (12, height - 24),
             axis_text,
