@@ -4,11 +4,6 @@
 """
 rs2ps_360PerspCut converts 360-degree panoramas into perspective or fisheye crops
 by orchestrating ffmpeg runs.
-It accepts files or directories, derives camera orientations from presets or
-manual modifiers, and emits view images with optional fisheye/top-down outputs.
-Field-of-view math is resolved from sensor and focal parameters, while ffmpeg
-jobs run in parallel with progress reporting and graceful cleanup.
-Cancellation uses the default Ctrl+C (SIGINT) handler for graceful shutdowns.
 """
 
 import argparse, json, math, pathlib, subprocess, sys, os, signal, threading, shlex, re, shutil
@@ -1042,3 +1037,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
