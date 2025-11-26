@@ -615,16 +615,24 @@ def build_view_jobs(args, files: List[pathlib.Path], out_dir: pathlib.Path) -> B
 
     add_map = parse_addcam_spec(args.addcam, args.addcam_deg)
     del_set = parse_delcam_spec(args.delcam)
+    user_addcam_supplied = bool(str(getattr(args, "addcam", "")).strip()) or bool(
+        getattr(args, "addcam_explicit", False)
+    )
+    user_delcam_supplied = bool(str(getattr(args, "delcam", "")).strip()) or bool(
+        getattr(args, "delcam_explicit", False)
+    )
     if preset_fisheyelike:
-        for ch in ("C", "D", "H", "I"):
-            del_set.add(letter_to_index1(ch))
-        for ch in ("A", "F"):
-            idx = letter_to_index1(ch)
-            slot = add_map.setdefault(idx, [])
-            if not any(abs(val - float(args.addcam_deg)) < 1e-6 for val in slot):
-                slot.append(float(args.addcam_deg))
-            if not any(abs(val + float(args.addcam_deg)) < 1e-6 for val in slot):
-                slot.append(-float(args.addcam_deg))
+        if not user_delcam_supplied:
+            for ch in ("A", "C", "D", "F", "H", "I"):
+                del_set.add(letter_to_index1(ch))
+        if not user_addcam_supplied:
+            for ch in ("A", "F"):
+                idx = letter_to_index1(ch)
+                slot = add_map.setdefault(idx, [])
+                if not any(abs(val - float(args.addcam_deg)) < 1e-6 for val in slot):
+                    slot.append(float(args.addcam_deg))
+                if not any(abs(val + float(args.addcam_deg)) < 1e-6 for val in slot):
+                    slot.append(-float(args.addcam_deg))
     if preset_two_views:
         for ch in ("B", "C", "D", "F", "G", "H"):
             del_set.add(letter_to_index1(ch))
@@ -898,16 +906,16 @@ def build_view_jobs(args, files: List[pathlib.Path], out_dir: pathlib.Path) -> B
                 )
             else:
                 sensor_line = f"[INFO] Sensor={args.sensor_mm} mm | size={w}x{h}"
-                focal_segment = f"focal length={f_used_mm:.3f}mm"
+                focal_segment = f"focal length=**{f_used_mm:.3f}**mm"
                 if focal_35mm_equiv is not None:
-                    focal_segment += f" (35mm eq={focal_35mm_equiv:.3f}mm)"
+                    focal_segment += f" (35mm eq=**{focal_35mm_equiv:.3f}**mm)"
                 realityscan_line = f"[INFO] For RealityScan: {focal_segment}"
                 if w > 0:
                     pixel_size_mm = sensor_w_mm / float(w)
                     if pixel_size_mm > 0:
                         focal_px = f_used_mm / pixel_size_mm
                         metashape_line = (
-                            "[INFO] For Metashape: Precalibrated f={:.5f} | pixel_size={:.4f} mm".format(
+                            "[INFO] For Metashape: Precalibrated f=**{:.5f}** | pixel_size=**{:.4f}** mm".format(
                                 focal_px, pixel_size_mm
                             )
                         )
