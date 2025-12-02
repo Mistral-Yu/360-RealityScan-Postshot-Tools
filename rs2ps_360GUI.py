@@ -172,9 +172,10 @@ FIELD_HELP_TEXT = {
     "input_path": "Select an image folder or Browse to choose a video file (mp4/mov/etc.). For videos, set preview FPS and ensure ffmpeg is configured.",
     "show_seam_overlay": "Overlay a translucent band along the panorama seam to visualise potential stitching artifacts.",
     "ffmpeg": "Path to the ffmpeg executable. Leave blank to use the system PATH.",
-    "jobs": "Number of parallel ffmpeg processes. 'auto' uses approximately half the CPU cores.",
-    "ffthreads": "Internal ffmpeg threads per process. Set greater than 1 for multi-threaded encoding.",
+    "jobs": "Number of parallel ffmpeg processes. 'auto' uses approximately half the CPU cores (video direct export halves this again).",
     "fps": "Frame extraction rate (fps) required when processing a video source.",
+    "start": "Optional start time (seconds) when exporting directly from video using FPS.",
+    "end": "Optional end time (seconds) when exporting directly from video using FPS.",
     "keep_rec709": "Convert Rec.709 to sRGB (unchecked = keep Rec.709).",
     "jpeg_quality_95": "When checked, save JPG outputs with approximately 95% quality rather than maximum quality.",
 }
@@ -442,7 +443,7 @@ def ensure_explicit_flags(args: argparse.Namespace) -> None:
 class PreviewApp:
     """Interactive GUI to tweak rs2ps_360 cuts and visualise overlays."""
 
-    VIDEO_PERSIST_FIELDS = {"fps", "keep_rec709"}
+    VIDEO_PERSIST_FIELDS = {"fps", "keep_rec709", "start", "end"}
     FIELD_DEFS = [
         {"name": "preset", "label": "Preset", "type": "choice", "choices": PRESET_CHOICES, "width": 14},
         {"name": "addcam", "label": "AddCam", "type": "str", "width": 18},
@@ -472,6 +473,26 @@ class PreviewApp:
             "col_shift": 0,
             "row_shift": 2,
             "required_if_video": True,
+        },
+        {
+            "name": "start",
+            "label": "Start (s)",
+            "type": "float_optional",
+            "width": 10,
+            "video_only": True,
+            "align_with": "count",
+            "col_shift": 0,
+            "row_shift": 2,
+        },
+        {
+            "name": "end",
+            "label": "End (s)",
+            "type": "float_optional",
+            "width": 10,
+            "video_only": True,
+            "align_with": "count",
+            "col_shift": 0,
+            "row_shift": 2,
         },
         {
             "name": "add_top",
@@ -537,7 +558,7 @@ class PreviewApp:
         self.is_executing = False
         self.source_is_video = False
         self._video_preview_signature: Optional[Tuple[pathlib.Path, bool]] = None
-        self.video_persist_state: Dict[str, Any] = {"fps": 2.0, "keep_rec709": True}
+        self.video_persist_state: Dict[str, Any] = {"fps": 2.0, "keep_rec709": True, "start": None, "end": None}
 
         self.scale_override = args.scale
         self.max_width_limit = int(args.max_width)
@@ -581,7 +602,6 @@ class PreviewApp:
         self._out_dir_custom = False
         self._tooltips: List[ToolTip] = []
         self.ffmpeg_path_var = tk.StringVar(value=str(getattr(self.current_args, "ffmpeg", "ffmpeg")))
-        self.ffthreads_var = tk.StringVar(value=str(getattr(self.current_args, "ffthreads", "1")))
         self.jobs_var = tk.StringVar(value=str(getattr(self.current_args, "jobs", "auto")))
         self.log_text: Optional[tk.Text] = None
         self.help_text: Optional[tk.Text] = None
@@ -591,7 +611,7 @@ class PreviewApp:
         self.preview_csv_entry: Optional[tk.Entry] = None
         self.preview_csv_button: Optional[tk.Button] = None
         self._preview_estimated_frames: Optional[int] = None
-        self._video_estimated_cache: Dict[str, int] = {}
+        self._video_estimated_cache: Dict[str, Dict[str, Any]] = {}
         self.right_inner: Optional[tk.Frame] = None
         self.notebook: Optional[ttk.Notebook] = None
 
@@ -1226,29 +1246,45 @@ class PreviewApp:
             est_int = int(estimated)
         except Exception:
             return
+        frame_rate = metadata.get("frame_rate")
+        try:
+            frame_rate = float(frame_rate)
+        except Exception:
+            frame_rate = None
         key = str(Path(video_path).expanduser().resolve())
-        self._video_estimated_cache[key] = est_int
+        self._video_estimated_cache[key] = {"estimated_frames": est_int, "frame_rate": frame_rate}
         self._preview_estimated_frames = est_int
 
-    def _get_estimated_frames(self, video_path: Path) -> Optional[int]:
+    def _get_estimated_frames_info(self, video_path: Path) -> Tuple[Optional[int], Optional[float]]:
         key = None
         try:
             key = str(Path(video_path).expanduser().resolve())
         except Exception:
             key = str(video_path)
         if key and key in self._video_estimated_cache:
-            return self._video_estimated_cache.get(key)
+            cached = self._video_estimated_cache.get(key, {})
+            return cached.get("estimated_frames"), cached.get("frame_rate")
         result = self._collect_video_metadata_lines(video_path, "Frame count probe")
         if not result:
-            return None
+            return None, None
         _lines, metadata = result
         self._store_estimated_frames(video_path, metadata)
+        frames = None
+        fps = None
         if metadata:
             try:
-                return int(metadata.get("estimated_frames"))
+                frames = int(metadata.get("estimated_frames"))
             except Exception:
-                return None
-        return None
+                frames = None
+            try:
+                fps = float(metadata.get("frame_rate"))
+            except Exception:
+                fps = None
+        return frames, fps
+
+    def _get_estimated_frames(self, video_path: Path) -> Optional[int]:
+        frames, _fps = self._get_estimated_frames_info(video_path)
+        return frames
 
     def _apply_detected_video_fps(self, metadata: Optional[Dict[str, Any]]) -> Tuple[Optional[str], bool]:
         if not metadata:
@@ -1540,12 +1576,12 @@ class PreviewApp:
             if video["bitrate"]:
                 lines.append(f"  Bit rate: {video['bitrate']}")
             if video["frame_rate"]:
-                lines.append(f"  Frame rate: **{video['frame_rate']:.3f}** fps")
+                lines.append(f"  Frame rate:  {video['frame_rate']:.3f} fps")
             elif video["frame_rate_text"]:
-                lines.append(f"  Frame rate: **{video['frame_rate_text']}**")
+                lines.append(f"  Frame rate:  {video['frame_rate_text']}")
             if video["frame_rate"] and duration_seconds is not None:
                 estimated_frames = int(round(duration_seconds * video["frame_rate"]))
-                lines.append(f"  Estimated frames: **{estimated_frames}**")
+                lines.append(f"  Estimated frames:  {estimated_frames}")
             if video["color_tags"]:
                 clean_color = [tag.rstrip(")") for tag in video["color_tags"]]
                 lines.append(f"  Color: {', '.join(clean_color)}")
@@ -2055,20 +2091,20 @@ class PreviewApp:
         self.right_inner = tk.Frame(self.controls_frame)
         self.right_inner.pack(fill="both", expand=True)
 
-        folder_frame = tk.LabelFrame(self.right_inner, text="Input Folder")
+        folder_frame = tk.LabelFrame(self.right_inner, text="Input (image folder / video)")
         folder_frame.pack(fill="x")
         path_entry = tk.Entry(folder_frame, textvariable=self.folder_path_var, width=38)
         path_entry.pack(side=tk.LEFT, fill="x", expand=True, padx=(8, 4), pady=4)
         self._bind_help(path_entry, "input_path")
         tk.Button(
             folder_frame,
-            text="Browse...",
-            command=lambda: self.prompt_for_directory(False),
+            text="Browse video...",
+            command=self._browse_video_input,
         ).pack(side=tk.RIGHT, padx=(4, 8), pady=4)
         tk.Button(
             folder_frame,
-            text="Load",
-            command=self.load_directory_from_entry,
+            text="Browse images...",
+            command=self._browse_image_input,
         ).pack(side=tk.RIGHT, padx=(4, 4), pady=4)
 
         output_frame = tk.LabelFrame(self.right_inner, text="Output Folder")
@@ -2102,7 +2138,7 @@ class PreviewApp:
             field_positions[name] = (row, col)
             video_only = bool(definition.get("video_only"))
             # Defer video-only fps/keep_rec709 layout to custom frame below.
-            if name == "fps":
+            if name in {"fps", "start", "end"}:
                 var = tk.StringVar()
                 self.field_vars[name] = var
                 self.field_widgets[name] = None
@@ -2175,17 +2211,8 @@ class PreviewApp:
             padx=4,
             pady=(6, 4),
         )
-        video_frame.columnconfigure(1, weight=1)
-        video_frame.columnconfigure(3, weight=1)
-
-        tk.Label(video_frame, text="FPS").grid(row=0, column=0, sticky="e", padx=4, pady=2)
-        fps_var = self.field_vars.get("fps")
-        fps_entry = self.field_widgets.get("fps")
-        if fps_var is not None and fps_entry is None:
-            fps_entry = tk.Entry(video_frame, textvariable=fps_var, width=8)
-            self.field_widgets["fps"] = fps_entry
-        if fps_entry is not None:
-            fps_entry.grid(row=0, column=1, sticky="we", padx=4, pady=2)
+        for col in (1, 3, 5, 6, 7):
+            video_frame.columnconfigure(col, weight=1, minsize=25)
 
         keep_var = self.field_vars.get("keep_rec709")
         keep_chk = self.field_widgets.get("keep_rec709")
@@ -2194,18 +2221,45 @@ class PreviewApp:
             keep_chk.configure(width=20)
             self.field_widgets["keep_rec709"] = keep_chk
         if keep_chk is not None:
-            keep_chk.grid(row=0, column=2, columnspan=2, sticky="w", padx=4, pady=2)
+            keep_chk.grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+
+        tk.Label(video_frame, text="FPS").grid(row=0, column=2, sticky="e", padx=4, pady=2)
+        fps_var = self.field_vars.get("fps")
+        fps_entry = self.field_widgets.get("fps")
+        if fps_var is not None and fps_entry is None:
+            fps_entry = tk.Entry(video_frame, textvariable=fps_var, width=6)
+            self.field_widgets["fps"] = fps_entry
+        if fps_entry is not None:
+            fps_entry.grid(row=0, column=3, sticky="we", padx=4, pady=2)
+
+        tk.Label(video_frame, text="Start (s)").grid(row=0, column=4, sticky="e", padx=4, pady=2)
+        start_var = self.field_vars.get("start")
+        start_entry = self.field_widgets.get("start")
+        if start_var is not None and start_entry is None:
+            start_entry = tk.Entry(video_frame, textvariable=start_var, width=6)
+            self.field_widgets["start"] = start_entry
+        if start_entry is not None:
+            start_entry.grid(row=0, column=5, sticky="we", padx=4, pady=2)
+
+        tk.Label(video_frame, text="End (s)").grid(row=0, column=6, sticky="e", padx=4, pady=2)
+        end_var = self.field_vars.get("end")
+        end_entry = self.field_widgets.get("end")
+        if end_var is not None and end_entry is None:
+            end_entry = tk.Entry(video_frame, textvariable=end_var, width=6)
+            self.field_widgets["end"] = end_entry
+        if end_entry is not None:
+            end_entry.grid(row=0, column=7, sticky="we", padx=4, pady=2)
 
         tk.Label(video_frame, text="CSV (selected frames)").grid(row=1, column=0, sticky="e", padx=4, pady=2)
         self.preview_csv_entry = tk.Entry(video_frame, textvariable=self.preview_csv_var, width=28)
-        self.preview_csv_entry.grid(row=1, column=1, sticky="we", padx=4, pady=2)
+        self.preview_csv_entry.grid(row=1, column=1, columnspan=4, sticky="we", padx=4, pady=2)
         self.preview_csv_button = tk.Button(
             video_frame,
             text="Browse...",
             command=self._browse_preview_csv,
             width=10,
         )
-        self.preview_csv_button.grid(row=1, column=2, columnspan=2, sticky="w", padx=4, pady=2)
+        self.preview_csv_button.grid(row=1, column=5, columnspan=2, sticky="w", padx=4, pady=2)
         try:
             self.preview_csv_var.trace_add("write", lambda *_args: self._update_preview_csv_state())
         except Exception:
@@ -2215,7 +2269,6 @@ class PreviewApp:
         ffmpeg_frame = tk.LabelFrame(self.right_inner, text="ffmpeg Options")
         ffmpeg_frame.pack(fill="x", pady=(4, 4))
         ffmpeg_frame.columnconfigure(1, weight=1)
-        ffmpeg_frame.columnconfigure(3, weight=1)
         ffmpeg_frame.columnconfigure(4, weight=0)
 
         ffmpeg_label = tk.Label(ffmpeg_frame, text="ffmpeg path")
@@ -2224,12 +2277,9 @@ class PreviewApp:
         ffmpeg_entry = tk.Entry(ffmpeg_frame, textvariable=self.ffmpeg_path_var, width=30)
         ffmpeg_entry.grid(row=0, column=1, padx=4, pady=2, sticky="we")
         self._bind_help(ffmpeg_entry, "ffmpeg")
-        browse_btn = tk.Button(ffmpeg_frame, text="Browse...", command=self.browse_ffmpeg)
+        browse_btn = tk.Button(ffmpeg_frame, text="Browse...", width=14, command=self.browse_ffmpeg)
         browse_btn.grid(row=0, column=2, padx=4, pady=2)
         self._bind_help(browse_btn, "ffmpeg")
-        reset_btn = tk.Button(ffmpeg_frame, text="Reset", command=self.reset_ffmpeg_path)
-        reset_btn.grid(row=0, column=3, padx=4, pady=2)
-        self._bind_help(reset_btn, "ffmpeg")
 
         jobs_label = tk.Label(ffmpeg_frame, text="Workers")
         jobs_label.grid(row=1, column=0, padx=4, pady=2, sticky="e")
@@ -2237,21 +2287,15 @@ class PreviewApp:
         jobs_entry = tk.Entry(ffmpeg_frame, textvariable=self.jobs_var, width=10)
         jobs_entry.grid(row=1, column=1, padx=4, pady=2, sticky="we")
         self._bind_help(jobs_entry, "jobs")
-        ffthreads_label = tk.Label(ffmpeg_frame, text="ffthreads")
-        ffthreads_label.grid(row=1, column=2, padx=4, pady=2, sticky="e")
-        self._bind_help(ffthreads_label, "ffthreads")
-        ffthreads_entry = tk.Entry(ffmpeg_frame, textvariable=self.ffthreads_var, width=10)
-        ffthreads_entry.grid(row=1, column=3, padx=4, pady=2, sticky="we")
-        self._bind_help(ffthreads_entry, "ffthreads")
 
         self.preview_inspect_button = tk.Button(
             ffmpeg_frame,
             text="Inspect video",
             command=self._inspect_preview_video_metadata,
             state="disabled",
-            width=16,
+            width=14,
         )
-        self.preview_inspect_button.grid(row=1, column=4, padx=(8, 4), pady=2, sticky="e")
+        self.preview_inspect_button.grid(row=1, column=2, padx=4, pady=2, sticky="e")
 
         buttons_frame = tk.LabelFrame(self.right_inner, text="Actions")
         buttons_frame.pack(fill="x", pady=(8, 12), ipady=6)
@@ -2264,7 +2308,7 @@ class PreviewApp:
         buttons_inner.grid_rowconfigure(0, weight=1)
         self.update_button = tk.Button(
             buttons_inner,
-            text="Update",
+            text="Refresh preview",
             command=self.on_update,
         )
         self.update_button.grid(row=0, column=0, padx=(0, 12), pady=0, sticky="nsew", ipadx=10, ipady=8)
@@ -3010,6 +3054,14 @@ class PreviewApp:
         if cores is None or cores <= 0:
             cores = 1
         return max(1, cores // 2)
+
+    def _effective_jobs(self) -> int:
+        """Return worker count, halving auto when exporting directly from video."""
+        requested = getattr(self.current_args, "jobs", "auto")
+        base = cutter.parse_jobs(requested)
+        if self.source_is_video and str(requested).lower() == "auto":
+            return max(1, base // 2)
+        return base
 
     def _update_ply_target_value_widgets(self) -> None:
         mode_label = self.ply_target_mode_var.get()
@@ -4654,8 +4706,22 @@ class PreviewApp:
             if fps_value is not None and fps_value > 0:
                 self.video_persist_state["fps"] = fps_value
             self.video_persist_state["keep_rec709"] = bool(self.field_vars["keep_rec709"].get())
+            start_text = self.field_vars["start"].get().strip() if "start" in self.field_vars else ""
+            end_text = self.field_vars["end"].get().strip() if "end" in self.field_vars else ""
+            try:
+                start_value = float(start_text) if start_text else None
+            except ValueError:
+                start_value = None
+            try:
+                end_value = float(end_text) if end_text else None
+            except ValueError:
+                end_value = None
+            self.video_persist_state["start"] = start_value
+            self.video_persist_state["end"] = end_value
             setattr(self.current_args, "fps", None)
             setattr(self.current_args, "keep_rec709", False)
+            setattr(self.current_args, "start", None)
+            setattr(self.current_args, "end", None)
             self._video_preview_signature = None
         self._update_preview_inspect_state()
         self._update_preview_csv_state()
@@ -4817,7 +4883,6 @@ class PreviewApp:
             var.set(display)
             self.form_snapshot[name] = display
         self.ffmpeg_path_var.set(str(getattr(self.current_args, "ffmpeg", getattr(self.defaults, "ffmpeg", "ffmpeg"))))
-        self.ffthreads_var.set(str(getattr(self.current_args, "ffthreads", getattr(self.defaults, "ffthreads", "1"))))
         self.jobs_var.set(str(getattr(self.current_args, "jobs", getattr(self.defaults, "jobs", "auto"))))
         if self.out_dir:
             self.output_path_var.set(str(self.out_dir))
@@ -4828,6 +4893,7 @@ class PreviewApp:
             self.output_path_var.set("")
         self._update_jpeg_quality_state()
         self._update_preview_inspect_state()
+        self._update_preview_csv_state()
 
 
     def _bind_help(self, widget: tk.Widget, key: str) -> None:
@@ -4858,6 +4924,7 @@ class PreviewApp:
         entry = self.preview_csv_entry
         button = self.preview_csv_button
         state = "normal" if enabled else "disabled"
+        csv_filled = bool(self.preview_csv_var.get().strip()) if self.preview_csv_var is not None else False
         try:
             if entry is not None:
                 entry.configure(state=state)
@@ -4867,12 +4934,22 @@ class PreviewApp:
             pass
         fps_widget = self.field_widgets.get("fps")
         if fps_widget is not None:
-            csv_filled = bool(self.preview_csv_var.get().strip()) if self.preview_csv_var is not None else False
             fps_state = "disabled"
             if self.source_is_video and not csv_filled:
                 fps_state = "normal"
             try:
                 fps_widget.configure(state=fps_state)
+            except tk.TclError:
+                pass
+        range_state = "disabled"
+        if self.source_is_video and not csv_filled:
+            range_state = "normal"
+        for name in ("start", "end"):
+            widget = self.field_widgets.get(name)
+            if widget is None:
+                continue
+            try:
+                widget.configure(state=range_state)
             except tk.TclError:
                 pass
 
@@ -4962,6 +5039,8 @@ class PreviewApp:
                         value = float(raw)
                         if name == "fps" and value <= 0:
                             raise ValueError("must be > 0")
+                        if name in {"start", "end"} and value < 0:
+                            raise ValueError("must be >= 0")
                         setattr(updated, name, value)
                         setattr(
                             updated,
@@ -4996,17 +5075,20 @@ class PreviewApp:
                     previous_flag(name) if raw == snapshot and raw else bool(raw),
                 )
 
+        start_val = getattr(updated, "start", None)
+        end_val = getattr(updated, "end", None)
+        if start_val is not None and end_val is not None and end_val <= start_val:
+            messagebox.showerror("Input Error", "End (s) must be greater than Start (s).")
+            return None
+        if self.source_is_video and bool(self.preview_csv_var.get().strip()):
+            updated.start = None
+            updated.end = None
+
         ffmpeg_path = self.ffmpeg_path_var.get().strip()
         if not ffmpeg_path:
             ffmpeg_path = getattr(self.defaults, "ffmpeg", "ffmpeg")
         updated.ffmpeg = ffmpeg_path
         self.ffmpeg_path_var.set(ffmpeg_path)
-
-        ffthreads_value = self.ffthreads_var.get().strip()
-        if not ffthreads_value:
-            ffthreads_value = str(getattr(self.defaults, "ffthreads", "1"))
-        updated.ffthreads = ffthreads_value
-        self.ffthreads_var.set(ffthreads_value)
 
         jobs_value = self.jobs_var.get().strip()
         if not jobs_value:
@@ -5084,7 +5166,6 @@ class PreviewApp:
     def on_preset_changed(self, selection: str) -> None:
         preset_value = selection or self.field_vars["preset"].get()
         current_ffmpeg = self.ffmpeg_path_var.get().strip() or getattr(self.defaults, "ffmpeg", "ffmpeg")
-        current_ffthreads = self.ffthreads_var.get().strip() or str(getattr(self.defaults, "ffthreads", "1"))
         current_jobs = self.jobs_var.get().strip() or str(getattr(self.defaults, "jobs", "auto"))
         video_prev_values = {
             "fps": getattr(self.current_args, "fps", None),
@@ -5095,7 +5176,6 @@ class PreviewApp:
         ensure_explicit_flags(self.current_args)
         self.current_args.preset = preset_value
         self.current_args.ffmpeg = current_ffmpeg
-        self.current_args.ffthreads = current_ffthreads
         self.current_args.jobs = current_jobs
         self.current_args.show_seam_overlay = seam_prev
         self._apply_preset_defaults(preset_value)
@@ -5131,6 +5211,48 @@ class PreviewApp:
                 self.output_path_var.set(str(self.out_dir))
             elif self.in_dir:
                 self._update_default_output_path()
+
+    def _browse_image_input(self) -> None:
+        current = self.folder_path_var.get().strip()
+        initial_dir = None
+        if current:
+            try:
+                path_obj = Path(current).expanduser()
+                initial_dir = path_obj if path_obj.is_dir() else path_obj.parent
+            except Exception:
+                initial_dir = None
+        if initial_dir is None:
+            initial_dir = self.in_dir if self.in_dir and self.in_dir.is_dir() else self.base_dir
+        selected = filedialog.askdirectory(parent=self.root, initialdir=str(initial_dir))
+        if selected:
+            if self.try_load_directory(selected):
+                self.folder_path_var.set(str(self.in_dir))
+                self.refresh_overlays(initial=True)
+
+    def _browse_video_input(self) -> None:
+        current = self.folder_path_var.get().strip()
+        initial_dir = None
+        if current:
+            try:
+                path_obj = Path(current).expanduser()
+                initial_dir = path_obj.parent if path_obj.is_file() else path_obj
+            except Exception:
+                initial_dir = None
+        if initial_dir is None:
+            initial_dir = self.in_dir.parent if self.in_dir and self.in_dir.is_file() else self.base_dir
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            initialdir=str(initial_dir),
+            title="Select input video",
+            filetypes=[
+                ("Video files", "*.mp4 *.mov *.m4v *.avi *.mkv *.wmv *.mpg *.mpeg *.mxf"),
+                ("All files", "*.*"),
+            ],
+        )
+        if selected:
+            if self.try_load_directory(selected):
+                self.folder_path_var.set(str(self.in_dir))
+                self.refresh_overlays(initial=True)
 
     def browse_ffmpeg(self) -> None:
         filename = filedialog.askopenfilename(
@@ -5403,6 +5525,7 @@ class PreviewApp:
         if ffmpeg_value and ffmpeg_value != ffmpeg_default:
             parts.extend(["--ffmpeg", ffmpeg_value])
 
+        csv_selected = bool(self.preview_csv_var.get().strip())
         defaults = self.defaults
         option_map = [
             ("--preset", "preset"),
@@ -5415,13 +5538,16 @@ class PreviewApp:
             ("--sensor-mm", "sensor_mm"),
             ("--ext", "ext"),
             ("-f", "fps"),
+            ("--start", "start"),
+            ("--end", "end"),
             ("--jobs", "jobs"),
-            ("--ffthreads", "ffthreads"),
             ("--print-cmd", "print_cmd"),
         ]
         for flag, name in option_map:
             value = getattr(self.current_args, name, None)
             if value in (None, ""):
+                continue
+            if name in {"start", "end"} and csv_selected:
                 continue
             if name == "addcam" and not str(value).strip():
                 continue
@@ -5432,8 +5558,6 @@ class PreviewApp:
             if name == "print_cmd" and value == "once":
                 continue
             if name == "ext" and str(value).lower() in {"jpg", "jpeg"}:
-                continue
-            if name == "ffthreads" and str(value).lower() in {"1", "auto"}:
                 continue
             default_value = getattr(defaults, name, None)
             if name in self.EXPLICIT_FIELDS:
@@ -5580,12 +5704,11 @@ class PreviewApp:
         info_lines: List[str] = [self.build_cli_command_line()]
 
         try:
-            jobs_parallel = cutter.parse_jobs(self.current_args.jobs)
+            jobs_parallel = self._effective_jobs()
         except Exception:
             jobs_parallel = self.current_args.jobs
         info_lines.append(
-            f"[INFO] parallel jobs: {jobs_parallel} "
-            f"/ ffthreads: {self.current_args.ffthreads} / total: {len(self.result.jobs)}"
+            f"[INFO] parallel jobs: {jobs_parallel} / total: {len(self.result.jobs)}"
         )
         if self.result.preview_views_line:
             info_lines.append(self.result.preview_views_line)
@@ -5647,21 +5770,38 @@ class PreviewApp:
                     return
                 video_path = Path(self.in_dir) if self.in_dir else None
                 estimate = None
+                estimate_fps = None
                 if video_path is not None:
-                    estimate = self._get_estimated_frames(video_path)
+                    estimate, estimate_fps = self._get_estimated_frames_info(video_path)
+                fps_out = getattr(self.current_args, "fps", None)
                 if estimate is not None:
-                    delta = abs(total_rows - estimate)
-                    if delta > 1:
-                        messagebox.showerror(
-                            "Selection CSV",
-                            f"CSV rows ({total_rows}) do not match estimated frames ({estimate}).\n"
-                            "Frame selection aborted.",
-                        )
-                        return
-                    if delta == 1:
-                        self.append_log_line(
-                            f"[warn] CSV rows ({total_rows}) differ from estimated frames ({estimate}) by 1; proceeding."
-                        )
+                    expected_output = estimate
+                    if fps_out and estimate_fps and estimate_fps > 0:
+                        expected_output = max(1, int(round(estimate * (float(fps_out) / float(estimate_fps)))))
+                    tol_output = max(1, int(expected_output * 0.05))
+                    delta_output = abs(total_rows - expected_output)
+                    if delta_output <= tol_output:
+                        if delta_output > 0:
+                            self.append_log_line(
+                                f"[warn] CSV rows ({total_rows}) differ from estimated output frames ({expected_output}) by {delta_output}; proceeding."
+                            )
+                    else:
+                        tol_input = max(1, int(estimate * 0.05))
+                        delta_input = abs(total_rows - estimate)
+                        fps_out_val = float(fps_out) if fps_out else None
+                        fps_reduced = fps_out_val is not None and estimate_fps and fps_out_val < estimate_fps
+                        if delta_input <= tol_input and fps_reduced:
+                            self.append_log_line(
+                                f"[info] CSV rows ({total_rows}) match source frames ({estimate}) "
+                                f"but output fps={fps_out_val} < input fps={estimate_fps}; accepting CSV row count."
+                            )
+                        else:
+                            messagebox.showerror(
+                                "Selection CSV",
+                                f"CSV rows ({total_rows}) do not match estimated output frames ({expected_output}).\n"
+                                f"(Estimated input frames: {estimate}, input fps: {estimate_fps}, output fps: {fps_out})",
+                            )
+                            return
                 else:
                     self.append_log_line("[info] Estimated frame count unavailable; proceeding without count check.")
                 self._selected_frame_indices = indices
@@ -5725,19 +5865,79 @@ class PreviewApp:
                             new_filters = f"{select_filter},{filters}"
                     cmd = list(cmd)
                     cmd[vf_idx + 1] = new_filters
+            # Preserve original frame numbers in filenames when using CSV selection.
+            if "-frame_pts" not in cmd:
+                cmd = list(cmd)
+                insert_at = max(1, len(cmd) - 1)
+                cmd.insert(insert_at, "1")
+                cmd.insert(insert_at, "-frame_pts")
+            if "-vsync" not in cmd:
+                cmd = list(cmd)
+                insert_at = max(1, len(cmd) - 1)
+                cmd.insert(insert_at, "vfr")
+                cmd.insert(insert_at, "-vsync")
             updated.append((cmd, src, dst))
         return updated
 
     def _run_execute_jobs(self, jobs: List[Tuple[List[str], str, str]]) -> None:
-        workers = cutter.parse_jobs(getattr(self.current_args, "jobs", "auto"))
-        total = len(jobs)
-        if total == 0:
+        try:
+            workers = self._effective_jobs()
+        except Exception:
+            workers = cutter.parse_jobs(getattr(self.current_args, "jobs", "auto"))
+        total_jobs = len(jobs)
+        if total_jobs == 0:
             self.root.after(0, self._on_execute_finished, 0, 0, 0, [])
             return
+        # For video direct export, scale progress by estimated frame count (or selection count) per view.
+        if self.source_is_video:
+            frames_per_job: Optional[int] = None
+            selected = getattr(self, "_selected_frame_indices", None)
+            if selected:
+                frames_per_job = len(selected)
+            if frames_per_job is None:
+                video_path = None
+                if self.files:
+                    try:
+                        video_path = Path(self.files[0])
+                    except Exception:
+                        video_path = None
+                if video_path is not None:
+                    frames_est, fps_in = self._get_estimated_frames_info(video_path)
+                    fps_out = getattr(self.current_args, "fps", None)
+                    if frames_est is not None:
+                        frames_effective = frames_est
+                        if fps_in and fps_in > 0:
+                            duration_est = frames_est / float(fps_in)
+                            start_val = getattr(self.current_args, "start", None)
+                            end_val = getattr(self.current_args, "end", None)
+                            start_sec = max(0.0, float(start_val)) if start_val is not None else 0.0
+                            end_limit = duration_est
+                            if end_val is not None:
+                                try:
+                                    end_limit = max(0.0, min(float(end_val), duration_est))
+                                except Exception:
+                                    end_limit = max(0.0, duration_est)
+                            trimmed = max(end_limit - start_sec, 0.0)
+                            frames_effective = int(round(trimmed * float(fps_in)))
+                        frames_effective = max(frames_effective, 1)
+                        if fps_out and fps_in and fps_in > 0:
+                            ratio = float(fps_out) / float(fps_in)
+                            frames_per_job = max(1, int(round(frames_effective * ratio)))
+                        else:
+                            frames_per_job = frames_effective
+            if frames_per_job is None or frames_per_job <= 0:
+                frames_per_job = 1
+            progress_units_per_job = frames_per_job
+            progress_total_units = progress_units_per_job * total_jobs
+            progress_label = "frames"
+        else:
+            progress_units_per_job = 1
+            progress_total_units = total_jobs
+            progress_label = "jobs"
         ok = 0
         fail = 0
         errors: List[str] = []
-        done = 0
+        done_units = 0
         last_pct = -1
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {
@@ -5746,7 +5946,7 @@ class PreviewApp:
             }
             for future in as_completed(future_map):
                 rc, err = future.result()
-                done += 1
+                done_units = min(progress_total_units, done_units + progress_units_per_job)
                 if rc == 0:
                     ok += 1
                 else:
@@ -5754,14 +5954,15 @@ class PreviewApp:
                     err_text = (err or "").strip()
                     if err_text:
                         errors.append(err_text)
-                pct = int((done * 100) / total)
+                pct = int((done_units * 100) / progress_total_units)
                 if pct == 100 or last_pct < 0 or (pct - last_pct) >= cutter.PROGRESS_INTERVAL:
                     last_pct = pct
-                    self.root.after(0, self._log_progress, pct, done, total)
+                    self.root.after(0, self._log_progress, pct, done_units, progress_total_units, progress_label)
         self.root.after(0, self._on_execute_finished, ok, fail, len(jobs), errors)
 
-    def _log_progress(self, pct: int, done: int, total: int) -> None:
-        self.append_log_line(f"Progress... {pct:3d}% ({done}/{total})")
+    def _log_progress(self, pct: int, done: int, total: int, label: str = "jobs") -> None:
+        suffix = f" {label}" if label else ""
+        self.append_log_line(f"Progress... {pct:3d}% ({done}/{total}{suffix})")
 
     def _on_execute_finished(
         self,
