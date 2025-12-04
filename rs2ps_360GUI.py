@@ -49,7 +49,7 @@ COLOR_CYCLE = [
     "#9b5de5",
 ]
 
-PRESET_CHOICES = ["default", "fisheyelike", "2views", "evenMinus30", "evenPlus30", "fisheyeXY"]
+PRESET_CHOICES = ["default", "fisheyelike", "full360coverage", "2views", "evenMinus30", "evenPlus30", "fisheyeXY"]
 
 HUMAN_MODE_CHOICES = ["mask", "alpha", "cutout", "keep_person", "remove_person", "inpaint"]
 
@@ -727,6 +727,8 @@ class PreviewApp:
         self._controls_frame_padding = 0
 
         self.root.title("rs2ps_360GUI")
+        self._output_monitor_stop = threading.Event()
+        self._output_monitor_thread: Optional[threading.Thread] = None
         self.build_ui()
         self.set_form_values()
         self.root.update_idletasks()
@@ -2553,6 +2555,7 @@ class PreviewApp:
         if not self.is_executing:
             return
         cutter.stop_event.set()
+        self._output_monitor_stop.set()
         if self.preview_stop_button is not None:
             self.preview_stop_button.configure(state="disabled")
         self.append_log_line("[EXEC] Stop requested...")
@@ -5155,6 +5158,7 @@ class PreviewApp:
     def _apply_preset_defaults(self, preset_value: str) -> None:
         preset_defaults: Dict[str, Dict[str, Any]] = {
             "fisheyelike": {"count": 10, "focal_mm": 17.0, "delcam": "C,D,H,I", "addcam": "A,F"},
+            "full360coverage": {"count": 8, "focal_mm": 14.0, "delcam": "B,D,F,H", "addcam": "B,D,F,H"},
             "2views": {"size": 3600, "focal_mm": 6.0, "delcam": "B,C,D,F,G,H"},
             "evenMinus30": {"setcam": "B:D30,D:D30,F:D30,H:D30"},
             "evenPlus30": {"setcam": "B:U30,D:U30,F:U30,H:U30"},
@@ -5838,10 +5842,25 @@ class PreviewApp:
         if self.result is None or not self.result.jobs:
             messagebox.showinfo("Information", "No jobs to run with the current settings.")
             return
-        if not messagebox.askyesno(
-            "Confirm",
-            "Run export with the current settings?\nFFmpeg will write results to the output folder.",
-        ):
+        selected_indices = getattr(self, "_selected_frame_indices", None)
+        jobs_snapshot = list(self.result.jobs)
+        if self.source_is_video and selected_indices:
+            jobs_snapshot = self._apply_frame_selection_to_jobs(jobs_snapshot, selected_indices)
+        planned_total = 0
+        if self.source_is_video:
+            frames_per_job = len(selected_indices) if selected_indices else self._estimate_frames_per_job(None)
+            if frames_per_job is None or frames_per_job <= 0:
+                frames_per_job = 1
+            planned_total = frames_per_job * len(jobs_snapshot)
+        else:
+            planned_total = len(jobs_snapshot)
+        planned_line = f"\nPlanned outputs: {planned_total:,} images." if planned_total > 0 else ""
+        confirm_text = (
+            "Run export with the current settings?\n"
+            "FFmpeg will write results to the output folder."
+            f"{planned_line}"
+        )
+        if not messagebox.askyesno("Confirm", confirm_text):
             return
         if self.out_dir:
             self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -5854,11 +5873,6 @@ class PreviewApp:
         if self.preview_stop_button is not None:
             self.preview_stop_button.configure(state="normal")
         self.append_log_line("[EXEC] Starting export...")
-        jobs_snapshot = list(self.result.jobs)
-        if self.source_is_video:
-            selected_indices = getattr(self, "_selected_frame_indices", None)
-            if selected_indices:
-                jobs_snapshot = self._apply_frame_selection_to_jobs(jobs_snapshot, selected_indices)
         thread = threading.Thread(
             target=self._run_execute_jobs,
             args=(jobs_snapshot,),
@@ -5972,6 +5986,88 @@ class PreviewApp:
                         frames_per_job = frames_effective
         return frames_per_job
 
+    def _count_output_matches(self, directory: Path, patterns: Sequence[str]) -> int:
+        total = 0
+        for pattern in patterns:
+            try:
+                total += len(list(directory.glob(pattern)))
+            except Exception:
+                continue
+        return total
+
+    def _output_monitor_loop(
+        self,
+        out_dir: Path,
+        patterns: Sequence[str],
+        initial_count: int,
+        total_units: int,
+        label: str,
+        interval_sec: float = 10.0,
+    ) -> None:
+        if total_units <= 0:
+            return
+        last_pct = -1
+        last_seen = -1
+        while not self._output_monitor_stop.is_set():
+            current = self._count_output_matches(out_dir, patterns)
+            done = max(0, current - initial_count)
+            if total_units > 0:
+                done = min(total_units, done)
+                pct = int((done * 100) / total_units)
+            else:
+                pct = 100
+            if done != last_seen:
+                if pct == 100 or last_pct < 0 or (pct - last_pct) >= cutter.PROGRESS_INTERVAL:
+                    last_pct = pct
+                    self.root.after(0, self._log_progress, pct, done, total_units, f"{label} (files)")
+            last_seen = done
+            if done >= total_units:
+                break
+            self._output_monitor_stop.wait(interval_sec)
+        self._output_monitor_stop.set()
+
+    def _start_output_monitor(
+        self,
+        jobs: Sequence[Tuple[List[str], str, str]],
+        total_units: int,
+        label: str,
+    ) -> bool:
+        if not self.source_is_video or total_units <= 0 or not jobs:
+            return False
+        # Prefer configured output folder; fall back to job destination parent.
+        out_dir = None
+        if self.out_dir:
+            try:
+                out_dir = Path(self.out_dir).expanduser()
+            except Exception:
+                out_dir = None
+        if out_dir is None:
+            try:
+                out_dir = Path(jobs[0][2]).expanduser().parent
+            except Exception:
+                out_dir = None
+        if out_dir is None or not out_dir.exists():
+            return False
+        patterns: Set[str] = set()
+        for _cmd, _src, dst in jobs:
+            name = Path(dst).name
+            if "%07d" in name:
+                name = name.replace("%07d", "*")
+            patterns.add(name)
+        if not patterns:
+            return False
+        initial_count = self._count_output_matches(out_dir, patterns)
+        self._output_monitor_stop.clear()
+        monitor = threading.Thread(
+            target=self._output_monitor_loop,
+            args=(out_dir, sorted(patterns), initial_count, total_units, label),
+            daemon=True,
+            name="output-monitor",
+        )
+        self._output_monitor_thread = monitor
+        monitor.start()
+        return True
+
     def _run_execute_jobs(self, jobs: List[Tuple[List[str], str, str]]) -> None:
         try:
             workers = self._effective_jobs()
@@ -5994,6 +6090,7 @@ class PreviewApp:
             progress_units_per_job = 1
             progress_total_units = total_jobs
             progress_label = "images"
+        monitor_active = self._start_output_monitor(jobs, progress_total_units, progress_label)
         ok_units = 0
         fail_units = 0
         errors: List[str] = []
@@ -6014,10 +6111,11 @@ class PreviewApp:
                     err_text = (err or "").strip()
                     if err_text:
                         errors.append(err_text)
-                pct = int((done_units * 100) / progress_total_units)
-                if pct == 100 or last_pct < 0 or (pct - last_pct) >= cutter.PROGRESS_INTERVAL:
-                    last_pct = pct
-                    self.root.after(0, self._log_progress, pct, done_units, progress_total_units, progress_label)
+                if not monitor_active:
+                    pct = int((done_units * 100) / progress_total_units)
+                    if pct == 100 or last_pct < 0 or (pct - last_pct) >= cutter.PROGRESS_INTERVAL:
+                        last_pct = pct
+                        self.root.after(0, self._log_progress, pct, done_units, progress_total_units, progress_label)
         self.root.after(0, self._on_execute_finished, ok_units, fail_units, progress_total_units, errors, progress_label)
 
     def _log_progress(self, pct: int, done: int, total: int, label: str = "jobs") -> None:
@@ -6032,6 +6130,7 @@ class PreviewApp:
         errors: List[str],
         label: str = "jobs",
     ) -> None:
+        self._output_monitor_stop.set()
         self.is_executing = False
         if self.update_button is not None:
             self.update_button.configure(state="normal")
