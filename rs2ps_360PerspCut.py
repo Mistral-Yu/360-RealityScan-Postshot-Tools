@@ -440,11 +440,12 @@ def create_arg_parser() -> argparse.ArgumentParser:
 
     ap.add_argument(
         "--preset",
-        choices=["default", "fisheyelike", "2views", "evenMinus30", "evenPlus30", "fisheyeXY"],
+        choices=["default", "fisheyelike", "full360coverage", "2views", "evenMinus30", "evenPlus30", "fisheyeXY"],
         default="default",
         help=(
             "default=8-view baseline / "
             "fisheyelike=10-view mix (auto focal 17mm, custom deletions/additions) / "
+            "full360coverage=8-view wide cover (auto focal 14mm, del B,D,F,H add B,D,F,H) / "
             "2views=front/back only (6mm focal, 3600px) / "
             "evenMinus30=even slots pitch -30deg / "
             "evenPlus30=even slots pitch +30deg / "
@@ -615,10 +616,14 @@ def build_view_jobs(args, files: List[pathlib.Path], out_dir: pathlib.Path) -> B
     preset_fisheye_xy = (args.preset == "fisheyeXY")
     preset_two_views = (args.preset == "2views")
     preset_fisheyelike = (args.preset == "fisheyelike")
+    preset_full360 = (args.preset == "full360coverage")
 
     if preset_fisheyelike:
         if args.count != 10:
             args.count = 10
+    elif preset_full360:
+        if args.count != 8:
+            args.count = 8
     elif preset_fisheye_xy:
         if args.count != 8:
             print("[INFO] preset 'fisheyeXY' forces count=8")
@@ -635,6 +640,8 @@ def build_view_jobs(args, files: List[pathlib.Path], out_dir: pathlib.Path) -> B
         args.focal_mm = 6.0
     if preset_fisheyelike and not hfov_explicit and not focal_explicit:
         args.focal_mm = 17.0
+    if preset_full360 and not hfov_explicit and not focal_explicit:
+        args.focal_mm = 14.0
 
     add_map = parse_addcam_spec(args.addcam, args.addcam_deg)
     del_set = parse_delcam_spec(args.delcam)
@@ -650,6 +657,18 @@ def build_view_jobs(args, files: List[pathlib.Path], out_dir: pathlib.Path) -> B
                 del_set.add(letter_to_index1(ch))
         if not user_addcam_supplied:
             for ch in ("A", "F"):
+                idx = letter_to_index1(ch)
+                slot = add_map.setdefault(idx, [])
+                if not any(abs(val - float(args.addcam_deg)) < 1e-6 for val in slot):
+                    slot.append(float(args.addcam_deg))
+                if not any(abs(val + float(args.addcam_deg)) < 1e-6 for val in slot):
+                    slot.append(-float(args.addcam_deg))
+    if preset_full360:
+        if not user_delcam_supplied:
+            for ch in ("B", "D", "F", "H"):
+                del_set.add(letter_to_index1(ch))
+        if not user_addcam_supplied:
+            for ch in ("B", "D", "F", "H"):
                 idx = letter_to_index1(ch)
                 slot = add_map.setdefault(idx, [])
                 if not any(abs(val - float(args.addcam_deg)) < 1e-6 for val in slot):
@@ -921,8 +940,10 @@ def build_view_jobs(args, files: List[pathlib.Path], out_dir: pathlib.Path) -> B
             if view_id and view_id not in seen_views:
                 seen_views.append(view_id)
         if seen_views:
+            view_count = len(seen_views)
+            count_label = f"{view_count} view" + ("s" if view_count != 1 else "")
             preview_views_line = (
-                f"[INFO] View summary ({first_src}): "
+                f"[INFO] View summary ({first_src}): {count_label} - "
                 + ", ".join(seen_views)
             )
             if preset_fisheye_xy:
