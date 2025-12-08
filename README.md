@@ -1,4 +1,4 @@
-# 360-RealityScan-Postshot-Tools
+# 360Cam-RealityScan-Postshot-Tools
 
 A consolidated toolkit for turning 360° video captures into RealityScan-friendly datasets and optimized point clouds that seed PostShot/3D Gaussian Splatting (3DGS) projects. The scripts cover every stage from frame extraction to PLY refinement, and the desktop GUI orchestrates the full flow.
 
